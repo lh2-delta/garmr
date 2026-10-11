@@ -25,12 +25,13 @@ with a one-line meaning, e.g. `garmr: exit 1 = incomplete archives found`.
 |---|---|
 | 0 | all archives complete |
 | 1 | any archive `INCOMPLETE` or `NO_ARCHIVE` |
-| 2 | usage / environment: input missing or empty, zero archives, output/work not writable, low disk, `scc` missing, disk full or permission error during extraction |
+| 2 | usage / environment: input missing or empty, zero archives, output/work not writable, low disk, an unparseable `LOC_TOLERANCE_PCT`, `scc` missing, disk full or permission error during extraction |
 | 3 | internal crash |
 | 130 / 143 | interrupted (SIGINT) / terminated (SIGTERM, e.g. `docker stop`) |
 
 The container runs with `init: true` and `stop_grace_period: 60s`, so `docker stop` / Ctrl-C lets Garmr clean up its scratch
-trees (130/143) instead of being SIGKILLed after 10 s.
+trees (130/143) instead of being SIGKILLed after 10 s. A stop request kills the running git / `tar` / `scc` child within about a
+second (a 30-minute `fsck` does not delay it); the archive in progress is abandoned and listed as `NOT_CHECKED` in `run_notes.txt`.
 
 **Folders and environment**
 
@@ -42,17 +43,20 @@ append `:z` to the three volume lines in `docker-compose.yml` (not added by defa
 | Variable | Meaning |
 |---|---|
 | `GITHUB_TOKEN` | optional: also compare counts with the GitHub API (see below). A live check that cannot run is a FAIL (`live_check_failed`), not silence. Never printed |
-| `LOC_TOLERANCE_PCT` | slack on the org-CSV `loc` comparison (default 0) |
+| `LOC_TOLERANCE_PCT` | slack on the org-CSV `loc` comparison (default 0); a non-number or negative value exits 2 with a message |
 | `GARMR_REQUIRE_FOR_CHECK` | `1`: an archive without a for-check fails (`for_check_missing`) instead of only being flagged `NO_FOR_CHECK` |
-| `GARMR_GIT_TIMEOUT` | seconds allowed per git / `scc` call (default 1800); on expiry the check `timeout` fails |
+| `GARMR_GIT_TIMEOUT` | seconds allowed per git / `scc` call (default 1800); on expiry the check `timeout` fails (the history-forgery scan is the exception: its timeout is a `history_forgery` WARN, since it is a heuristic) |
+| `GARMR_MAX_EXTRACT_BYTES` / `_MEMBERS` / `_RATIO` / `GARMR_EXTRACT_TIMEOUT` | per-archive extraction caps (default 200 GiB, 5,000,000 members, 200x expansion once past 1 GiB, 3600 s). An archive past a cap, or declaring more than the free disk, is a `FAIL archive_integrity` for that archive only; the run continues |
+| `GARMR_MAX_JSON_BYTES` | a metadata `.json` over this size (default 4 GiB) is a `FAIL metadata_json` and is not loaded |
 | `GARMR_FSCK_TIMEOUT` | seconds allowed for `git fsck --full` (default 3600) |
 | `HOST_UID` / `HOST_GID` | user the container runs as; set by `run.sh` |
 | `INPUT_DIR` / `OUTPUT_DIR` / `WORK_DIR` | host folders (above) |
 | `GARMR_IMAGE` | image tag (default `garmr:latest`) |
 | `GARMR_SCRATCH` | internal: where LOC temp files go (inside `work/`); do not set |
 
-**Disk.** `work/` needs roughly the size of the **largest single tarball, extracted** (a zip bundle is processed one member at
-a time). LOC temp files also live in `work/` (`GARMR_SCRATCH`). Scratch dirs are `work/garmr-*`; leftovers from a crashed run are
+**Disk.** `work/` needs roughly **3.2x the largest single tarball** (a zip bundle is processed one member at a time): the
+extracted tree (about 1.2x), plus a bare clone of a GitLab bundle and the LOC checkout of HEAD, which are about one archive each
+and exist at the same time. LOC temp files also live in `work/` (`GARMR_SCRATCH`). Scratch dirs are `work/garmr-*`; leftovers from a crashed run are
 removed at the next start. A run with too little free space exits 2 before extracting.
 
 **`scc` is required.** It measures lines of code for the org-CSV LOC floor, and a run without it would skip that check without
@@ -75,7 +79,7 @@ All files are created mode `0600` (owner only), since they list repo names and w
 
 | File | Contents |
 |---|---|
-| `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `for_check` (`yes` / `no` / `unreadable`), counts found in the archive, the org's numbers, `flags` |
+| `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `for_check` (`yes` / `no` / `unreadable` / `empty`), counts found in the archive, the org's numbers, `flags` |
 | `missing_items.csv` | only errors: one row per failed check with `expected`, `found`, `missing_count`, `missing_items` (e.g. PR numbers in git but with no metadata record) |
 | `run_notes.txt` | non-fatal notices: CSVs skipped or unused, `.xlsx` files not read, archives that were not checked |
 
@@ -98,7 +102,9 @@ the `flags` column are notices, not failures:
 | `ORG_LOWER:<metric>` | the archive holds more than the org CSV says (allowed, see lower bound) |
 | `LOC_BRANCH_DIFF` | `loc` differs, possibly because CSV and archive use different branches |
 | `NOT_IN_ORG_CSV` | archive's repo has no org-CSV row |
-| `AMBIGUOUS_ORG_ROW` | more than one org-CSV row could match; not guessed |
+| `AMBIGUOUS_ORG_ROW` | more than one org-CSV row could match; not guessed, so no org number is compared for this repo |
+| `LOC_UNMEASURED` | the org CSV has a `loc` but Garmr could not measure the archive's lines of code (see the `loc_unmeasured` WARN); not compared |
+| `ORG_UNCOMPARED:<metric>` | the org CSV has this metric but the archive's value is unknown (e.g. `prs` for a plain git repo): not compared |
 
 ## What is checked
 
@@ -162,9 +168,10 @@ Format: columns `repo,section,key,value`; a blank value means unknown and is nev
 
 | Value / flag | Meaning |
 |---|---|
-| `for_check=yes` / `no` / `unreadable` | a for-check was found and parsed / none for this archive / found but could not be parsed |
+| `for_check=yes` / `no` / `unreadable` / `empty` | a for-check was found and parsed / none for this archive / found but could not be parsed / found but has no rows |
 | `NO_FOR_CHECK` | archive has no for-check; only the offline checks ran |
 | `FOR_CHECK_UNREADABLE` | the file could not be parsed (wrong header, bad encoding); nothing crashes, no for-check checks run |
+| `FOR_CHECK_EMPTY` | the file is empty or has a header but no rows; nothing was compared (status `empty` in the `for_check` column) |
 | `FOR_CHECK_UNKNOWN:<entity>` | that count is blank in both snapshots: not compared, but flagged |
 
 A for-check with no matching archive gives a `NO_ARCHIVE` row (`for_check=yes`) and an `archive_missing` row in `missing_items.csv`.
@@ -209,13 +216,16 @@ Further checks, all FAIL unless noted (`item` is the value in `missing_items.csv
 | `for_check_unusable` | the for-check exists but cannot be parsed or used |
 | `for_check_missing` | archive has no for-check and `GARMR_REQUIRE_FOR_CHECK=1` |
 | `for_check_unmatched` | a for-check row set matches no archive/repo |
-| `live_check_failed` | `GITHUB_TOKEN` is set but the API comparison could not be completed |
+| `live_check_failed` | `GITHUB_TOKEN` is set but the API comparison could not be completed, or the API would not count one entity (403/404/rate limit): one finding per entity in `item` (WARN for `collaborators`, which needs push access) |
 | `repo_unlisted` | a repository is in the archive but not in its repository metadata (or the reverse) |
 | `kind_missing` | a metadata kind that must exist is absent |
-| `timeout` | a git / `scc` / fsck call exceeded `GARMR_GIT_TIMEOUT` / `GARMR_FSCK_TIMEOUT` |
+| `timeout` | a git / `scc` / fsck call exceeded `GARMR_GIT_TIMEOUT` / `GARMR_FSCK_TIMEOUT` (except the history-forgery scan: WARN) |
+| `archive_integrity` | the archive does not read, would expand past an extraction cap or the free disk, or nests archives more than 3 levels deep |
+| `git_integrity` | also when a git read that must succeed (`rev-list`, `for-each-ref`...) fails after fsck passed: the repo is reported not verified, never as having nothing to report |
+| `loc_unmeasured` (WARN) | lines of code could not be measured (no `scc`, tree unreadable, `scc` output unusable) |
 | `analysis_error` | a check crashed on this archive; the archive is reported INCOMPLETE rather than skipped |
 | `metadata_json` | a metadata `.json` file is not valid JSON |
-| `unsafe_member` (WARN) | archive member with an absolute path or `..` was not extracted |
+| `unsafe_member` (WARN) | archive member with an absolute path or `..` (tar or zip) was not extracted |
 
 Git is verified with `git fsck --full` (object content, not just connectivity), with the timeouts above.
 
@@ -245,6 +255,13 @@ python3 -m pytest -q
 - **Not calibrated on real exports.** The GitLab layout is detected as `project.json` at the root or in `tree/`, plus
   `repo.bundle` or `project.bundle`, and has only been tried on synthetic fixtures. The GitHub layout is not officially documented;
   the checks follow GitHub migration tarballs as observed. The for-check path was tested on synthetic fixtures only.
+- GitHub metadata `.json` files are parsed whole (memory is several times the file size, so `GARMR_MAX_JSON_BYTES` bounds it); GitLab
+  `.ndjson` is read line by line, but its parsed records are held. A repo with tens of millions of records needs a big host.
+- Commit-message markers (`Merge pull request #N`, `(#N)`, `closes #N`, GitLab `See merge request path!N`) prove a PR existed in
+  *this* repo only when the history is its own: for a fork or a repo whose history is older than its `created_at` they are only
+  a WARN (`pull_requests` / `number_refs`). A GitLab MR line naming another project is ignored.
+- LOC is counted on a checkout of the default branch from the object store, with `.gitignore`, `.ignore`, `.sccignore` and
+  `export-ignore` all disregarded, so tracked-but-ignored files count.
 - **Nothing has been validated on large (multi-GB) archives**: timings, disk needs and timeouts are untested at that scale.
 - **The first real runs may produce false positives.** Send the `missing_items.csv` rows and the checks can be tuned.
 - A well-formed file that lacks entries nothing else references (3 of 5 labels where no issue uses the other 2) can only be
