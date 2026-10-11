@@ -345,3 +345,111 @@ def test_ndjson_is_streamed_and_bad_line_reported(tmp_path):
     out = ce.read_ndjson(p, fl)
     assert out == [{"a": 1}, {"a": 2}] and any("bad JSON" in f["detail"] for f in fl)
     assert names({"findings": fl}) == {"metadata_json"}
+
+
+# ================================================================ batch.py / forcheck.py
+
+import batch  # noqa: E402
+from conftest import b_archive, b_env, b_read  # noqa: E402
+from garmr import forcheck  # noqa: E402
+
+
+def _org(entries, metric="commits"):
+    return {"entries": entries, "index": batch.build_index(entries), "metrics": {metric: metric}, "files": []}
+
+
+def _entry(label, **vals):
+    return {"owner": "acme", "name": "widgets", "label": label, "rows": 1, "bad": set(), "files": ["o.csv"],
+            "vals": {m: vals.get(m) for m in batch.ORG_METRICS}}
+
+
+def _rec(**metrics):
+    return {"repo": "acme/widgets", "provider": "github", "archive": "acme-widgets.tar.gz", "metrics": metrics,
+            "findings": [], "for_check": "no"}
+
+
+def _st(org):
+    return {"org": org, "tol": 0.0, "matched": set(), "seen_star": set(), "require_fc": False}
+
+
+# 2
+def test_ambiguous_org_row_is_flagged_not_compared():
+    org = _org([_entry("acme/widgets", commits=999), _entry("acme/widgets-dup", commits=5)])
+    rec = _rec(commits_all=1, commits_head=1)
+    (row,), miss = batch.build_rows(rec, _st(org))
+    assert "AMBIGUOUS_ORG_ROW" in row["flags"] and row["status"] == "COMPLETE" and not miss
+    assert row["org_commits"] == ""
+
+
+# 9
+def test_unknown_pr_counts_are_not_compared():
+    errs, flags, _ = batch.compare_metrics(_org([], "prs"), {"prs": "5"}, {}, 0)
+    assert errs == [] and "ORG_UNCOMPARED:prs" in flags
+
+
+def test_known_zero_pr_counts_still_compare():
+    errs, _, _ = batch.compare_metrics(_org([], "prs"), {"prs": "5"}, {"prs_git": 0, "prs_meta": 0}, 0)
+    assert errs and errs[0]["item"] == "prs"
+
+
+# 7
+def test_unmeasured_loc_is_flagged():
+    errs, flags, _ = batch.compare_metrics(_org([], "loc"), {"loc": "500"}, {"loc": None}, 0)
+    assert errs == [] and "LOC_UNMEASURED" in flags
+
+
+# 18
+def test_identifier_cells_keep_leading_dash_but_formulas_are_escaped():
+    assert batch.csv_safe("-tool", identifier=True) == "-tool"
+    assert batch.csv_safe("-tool") == "'-tool"
+    assert batch.csv_safe("=cmd", identifier=True) == "'=cmd"
+    assert batch.csv_safe("-1+cmd|x", identifier=True) == "'-1+cmd|x"
+
+
+# 6
+def test_signal_handler_wakes_running_children():
+    ce.clear_stop()
+    try:
+        batch._on_signal(15, None)
+        assert ce._STOP.is_set()
+    finally:
+        ce.clear_stop()
+        batch._STOP["sig"] = None
+
+
+def test_stop_inside_an_archive_marks_it_not_checked(tmp_path, monkeypatch):
+    inp, out, work = b_env(tmp_path, monkeypatch)
+    b_archive(inp, tmp_path, "acme-a")
+
+    def stop(*a, **k):
+        raise ce.Interrupted("git fsck")
+    monkeypatch.setattr(batch, "analyse_archive", stop)
+    res = batch._run(inp, out, work, want_loc=False)
+    assert res["interrupted"] and not res["finalized"] and not res["crash"]
+    assert any("NOT_CHECKED: acme-a.tar.gz" in n for n in res["notes"].items)
+    assert not list(work.glob("garmr-*"))
+    batch._STOP["sig"] = None
+
+
+# 20e
+def test_bad_loc_tolerance_exits_two_with_a_message(tmp_path, monkeypatch, capsys):
+    inp, out, work = b_env(tmp_path, monkeypatch)
+    b_archive(inp, tmp_path)
+    monkeypatch.setenv("LOC_TOLERANCE_PCT", "abc")
+    assert batch.main([]) == 2
+    assert "LOC_TOLERANCE_PCT" in capsys.readouterr().err
+
+
+# 19
+def test_for_check_file_paths_cannot_escape_the_extract_root(tmp_path):
+    root = tmp_path / "x" / "root"
+    root.mkdir(parents=True)
+    (root / "schema.json").write_text("{}")
+    (tmp_path / "x" / "outside.txt").write_text("hello")
+    (tmp_path / "abs.txt").write_text("hello")
+    rows = [("acme/widgets", "file", "../outside.txt", 5), ("acme/widgets", "file", str(tmp_path / "abs.txt"), 5),
+            ("acme/widgets", "file", "schema.json", 2)]
+    fc = forcheck.ForCheck(tmp_path / "x.for-check.csv", rows)
+    out = forcheck.file_listing_findings(fc, Path("a.tar.gz"), root)
+    miss = [f for f in out if f["item"] == "missing"]
+    assert miss and set(miss[0]["missing"]) == {"../outside.txt", str(tmp_path / "abs.txt")}

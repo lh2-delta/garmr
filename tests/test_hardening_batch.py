@@ -508,11 +508,15 @@ def test_c6_formula_cells_neutralised_and_newlines_stripped(tmp_path, monkeypatc
     b_archive(inp, tmp_path)
     org_csv(inp, [{"org": "", "repo": "=HYPERLINK(1)", "total_commits": "5"},
                   {"org": "", "repo": "@evil", "total_commits": "5"},
-                  {"org": "", "repo": "-bad", "total_commits": "5"}], head=["org", "repo", "total_commits"])
+                  {"org": "", "repo": "-bad", "total_commits": "5"},
+                  {"org": "", "repo": "-1+cmd|' /C calc'!A0", "total_commits": "5"}],
+            head=["org", "repo", "total_commits"])
     go(inp, out, work)
     rows = b_read(out / "completeness_report.csv")
     repos = {r["repo"] for r in rows}
-    assert "'=HYPERLINK(1)" in repos and "'@evil" in repos and "'-bad" in repos
+    # '-bad' is a legal repo name and a join key downstream: left untouched; a '-' cell with formula characters is not
+    assert "'=HYPERLINK(1)" in repos and "'@evil" in repos and "-bad" in repos
+    assert "'-1+cmd|' /C calc'!A0" in repos
     assert [r for r in rows if r["repo"] == "acme/widgets"]
 
 
