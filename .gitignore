@@ -1,0 +1,7 @@
+input/
+output/
+work/
+__pycache__/
+.pytest_cache/
+*.partial
+*.pyc

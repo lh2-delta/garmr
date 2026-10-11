@@ -1,0 +1,10 @@
+input/
+output/
+work/
+tests/
+.git
+__pycache__/
+**/__pycache__
+.pytest_cache/
+*.pyc
+*.partial

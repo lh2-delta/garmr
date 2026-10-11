@@ -1,0 +1,24 @@
+services:
+  garmr:
+    build:
+      context: .
+      args:
+        GARMR_SRC_HASH: "${GARMR_SRC_HASH:-unknown}"   # fingerprint of the sources, set by run.sh; lets it detect a stale image
+    image: ${GARMR_IMAGE:-garmr:latest}
+    # Run through ./run.sh: it creates the host folders and sets HOST_UID/HOST_GID so output is not root-owned.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    # Python is PID 1; tini (init) forwards signals so `docker stop` ends the run cleanly instead of SIGKILL after 10s.
+    init: true
+    stop_grace_period: 60s
+    volumes:
+      # host side defaults to folders next to this file; override with INPUT_DIR / OUTPUT_DIR / WORK_DIR
+      # (on SELinux hosts append :z to each, see README)
+      - ${INPUT_DIR:-./input}:/data/input:ro     # repo .zip/.tar.gz files, their .for-check.csv, the organisation's metrics .csv
+      - ${OUTPUT_DIR:-./output}:/data/output     # completeness_report.csv, missing_items.csv, run_notes.txt
+      - ${WORK_DIR:-./work}:/data/work           # scratch: one archive extracted at a time, deleted after its check
+    environment:
+      LOC_TOLERANCE_PCT: "${LOC_TOLERANCE_PCT:-0}"
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"          # optional: also compare counts with the GitHub API
+      GARMR_REQUIRE_FOR_CHECK: "${GARMR_REQUIRE_FOR_CHECK:-}"
+      GARMR_GIT_TIMEOUT: "${GARMR_GIT_TIMEOUT:-}"
+      GARMR_FSCK_TIMEOUT: "${GARMR_FSCK_TIMEOUT:-}"
