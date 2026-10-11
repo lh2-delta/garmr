@@ -15,6 +15,10 @@ Environment:
   GARMR_SCRATCH        directory for every temp file (default: system temp dir)
   GARMR_GIT_TIMEOUT    seconds allowed for each git/scc/tar call (default 1800); expiry is a FAIL `timeout` finding
   GARMR_FSCK_TIMEOUT   seconds allowed for git fsck (default 3600)
+  GARMR_MAX_EXTRACT_BYTES / GARMR_MAX_EXTRACT_MEMBERS / GARMR_MAX_EXTRACT_RATIO / GARMR_EXTRACT_TIMEOUT
+                       per-archive extraction caps (default 200 GiB / 5,000,000 members / 200x / 3600 s); a bigger
+                       archive is a FAIL archive_integrity for that archive only, not a run-wide abort
+  GARMR_MAX_JSON_BYTES one metadata JSON file larger than this (default 4 GiB) is a FAIL metadata_json, not loaded
 """
 from __future__ import annotations
 
@@ -36,11 +40,11 @@ import urllib.request
 import zipfile
 import zlib
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 ARCHIVE_SUFFIXES = (".tar.gz", ".tgz", ".tar", ".zip")
-ZERO_BYTE_ALLOW = {".gitkeep", ".keep", ".nojekyll", "__init__.py", "packed-refs"}
+ZERO_BYTE_ALLOW = {".gitkeep", ".keep", ".nojekyll", "__init__.py", "packed-refs", "FETCH_HEAD"}
 GITHUB_JSON = re.compile(r"^(?P<kind>[a-z_]+?)_(?P<n>\d+)\.json$")
 LFS_SIG = "version https://git-lfs.github.com/spec/v1"
 GIT_SUFFIX = re.compile(r"\.git$")
@@ -86,6 +90,30 @@ class EnvironmentProblem(Exception):
         self.kind, self.detail = kind, detail
 
 
+class Interrupted(BaseException):
+    """A stop was requested (SIGTERM/SIGINT) while a child process ran; the child was killed. BaseException so that
+    the per-repo `except Exception` safety nets cannot turn a stop into an analysis_error row."""
+
+
+class GitError(Exception):
+    """A git command that must succeed exited non-zero: its output cannot be trusted as 'no facts'."""
+
+    def __init__(self, what, code, stderr=""):
+        super().__init__(f"{what} failed (exit {code})" + (f": {stderr.strip()[:200]}" if stderr and stderr.strip() else ""))
+        self.what, self.code = what, code
+
+
+_STOP = threading.Event()
+
+
+def request_stop():
+    _STOP.set()
+
+
+def clear_stop():
+    _STOP.clear()
+
+
 class CmdTimeout(Exception):
     def __init__(self, what, seconds):
         super().__init__(f"{what} timed out after {seconds:g}s")
@@ -127,6 +155,10 @@ def git_timeout():
     return _env_float("GARMR_GIT_TIMEOUT", 1800.0)
 
 
+def max_json_bytes():
+    return _env_float("GARMR_MAX_JSON_BYTES", float(4 << 30))
+
+
 def fsck_timeout():
     return _env_float("GARMR_FSCK_TIMEOUT", 3600.0)
 
@@ -154,22 +186,89 @@ def timeout_finding(label, e: CmdTimeout):
 
 
 def run_cmd(cmd, what, timeout=None, **kw):
+    """subprocess.run(capture_output) that also notices a stop request within ~0.5 s and kills the child."""
     t = timeout or git_timeout()
     kw.setdefault("encoding", "utf-8")
     kw.setdefault("errors", "replace")
-    try:
-        return subprocess.run(cmd, capture_output=True, timeout=t, **kw)
-    except subprocess.TimeoutExpired:
-        raise CmdTimeout(what, t) from None
+    check, inp = kw.pop("check", False), kw.pop("input", None)
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE if inp is not None else None, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, **kw)
+    deadline = time.monotonic() + t
+    while True:
+        if _STOP.is_set():
+            p.kill()
+            p.communicate()
+            raise Interrupted(what)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            p.kill()
+            p.communicate()
+            raise CmdTimeout(what, t)
+        try:
+            out, err = p.communicate(input=inp, timeout=min(0.5, left))
+            break
+        except subprocess.TimeoutExpired:
+            inp = None      # already handed to the child by the first communicate()
+    r = subprocess.CompletedProcess(cmd, p.returncode, out, err)
+    if check and r.returncode:
+        raise subprocess.CalledProcessError(r.returncode, cmd, out, err)
+    return r
 
 
 # ---------------------------------------------------------------- extraction
+
+def _env_int(name, default):
+    return int(_env_float(name, default))
+
+
+MAX_NEST_DEPTH = 3                 # archives inside archives inside archives; deeper is reported, not opened
+RATIO_MIN_BYTES = 1 << 30          # the compression-ratio cap only applies once the output is this big
+
+
+class ExtractLimit(Exception):
+    """The archive would expand past a cap or the free disk: a verdict on that archive, not a host fault."""
+
+
+class _Budget:
+    """Running totals for one extraction. Tar sizes come from member headers (checked before each write); zip sizes
+    are pre-summed from the central directory, which the zip reader also enforces while reading."""
+
+    def __init__(self, archive: Path, dest: Path):
+        self.max_bytes = _env_int("GARMR_MAX_EXTRACT_BYTES", 200 << 30)
+        self.max_members = _env_int("GARMR_MAX_EXTRACT_MEMBERS", 5_000_000)
+        self.max_ratio = _env_float("GARMR_MAX_EXTRACT_RATIO", 200.0)
+        self.deadline = time.monotonic() + _env_float("GARMR_EXTRACT_TIMEOUT", 3600.0)
+        try:
+            self.src = max(archive.stat().st_size, 1)
+            self.free = shutil.disk_usage(dest).free
+        except OSError:
+            self.src, self.free = 1, None
+        self.total = self.members = 0
+
+    def add(self, size, members=1):
+        if _STOP.is_set():
+            raise Interrupted("extraction")
+        if time.monotonic() > self.deadline:
+            raise ExtractLimit("extraction exceeded its time limit (GARMR_EXTRACT_TIMEOUT)")
+        self.members += members
+        self.total += max(size or 0, 0)
+        if self.members > self.max_members:
+            raise ExtractLimit(f"archive has more than {self.max_members} members (GARMR_MAX_EXTRACT_MEMBERS)")
+        if self.total > self.max_bytes:
+            raise ExtractLimit(f"archive expands past {self.max_bytes} bytes (GARMR_MAX_EXTRACT_BYTES)")
+        if self.total > RATIO_MIN_BYTES and self.total > self.max_ratio * self.src:
+            raise ExtractLimit(f"archive expands {self.total // self.src}x its size (GARMR_MAX_EXTRACT_RATIO), "
+                               "likely a decompression bomb")
+        if self.free is not None and self.total > self.free:
+            raise ExtractLimit(f"archive expands to {self.total}+ bytes but only {self.free} bytes are free "
+                               "in the work folder")
+
 
 def _passthrough(member, _path):
     return member
 
 
-def _safe_extract(t: tarfile.TarFile, dest: Path, skipped):
+def _safe_extract(t: tarfile.TarFile, dest: Path, skipped, budget=None):
     """Extract every member that passes the 'data' filter; skip (and record) the ones that do not."""
     for m in t:
         try:
@@ -180,32 +279,49 @@ def _safe_extract(t: tarfile.TarFile, dest: Path, skipped):
             continue
         if fm is None:
             continue
+        if budget:
+            budget.add(fm.size if fm.isreg() else 0)
         t.extract(fm, str(dest), filter=_passthrough)
+
+
+def _unsafe_zip_name(name):
+    parts = PurePosixPath(name.replace("\\", "/")).parts
+    return name.startswith(("/", "\\")) or ".." in parts or bool(re.match(r"^[A-Za-z]:", name))
 
 
 def extract(archive: Path, dest: Path, skipped=None):
     """Extract fully; returns None on success or an error string describing a genuinely bad archive.
 
-    Unsafe tar members (absolute/escaping links, ../ paths, device files) are skipped and their names appended to
-    `skipped`. Host problems (disk full, permissions, I/O) raise EnvironmentProblem, never an archive error.
+    Unsafe members (absolute/escaping links, ../ or absolute paths, device files) are skipped and their names appended
+    to `skipped`. An archive that would blow a size/member/ratio/time cap or the free disk is an error string for
+    that archive. Host problems (disk full, permissions, I/O) raise EnvironmentProblem, never an archive error.
     """
     try:
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         raise (as_env(e) or EnvironmentProblem("io", f"{type(e).__name__}: {e}"))
     is_zip = archive.name.lower().endswith(".zip")
+    budget = _Budget(archive, dest)
     try:
         if is_zip:
             with zipfile.ZipFile(archive) as z:
+                infos = z.infolist()
+                budget.add(sum(i.file_size for i in infos), len(infos))
                 bad = z.testzip()
                 if bad:
                     return f"CRC error in member {bad}"
-                z.extractall(dest)
+                # extractall() would silently rewrite ../ and absolute names into the tree; skip and report instead
+                safe = [i for i in infos if not _unsafe_zip_name(i.filename)]
+                if skipped is not None:
+                    skipped.extend(i.filename for i in infos if _unsafe_zip_name(i.filename))
+                z.extractall(dest, members=safe)
         else:
             with tarfile.open(archive) as t:
-                _safe_extract(t, dest, skipped)
-    except EnvironmentProblem:
+                _safe_extract(t, dest, skipped, budget)
+    except (EnvironmentProblem, Interrupted):
         raise
+    except ExtractLimit as e:
+        return f"not extracted: {e}"
     except RuntimeError as e:
         if "encrypted" in str(e).lower() or "password" in str(e).lower():
             return f"encrypted zip, cannot be read without a password: {e}"
@@ -252,17 +368,32 @@ def find_unit_root(root: Path):
     return root, None
 
 
+def _unique_dir(work: Path, name):
+    """work/<safe name>, or a numbered sibling when an earlier archive of the same name already used it, so two
+    a.tar.gz from different folders never merge into one tree."""
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    out, n = work / base, 0
+    while out.exists():
+        n += 1
+        out = work / f"{base}.{n}"
+    return out
+
+
 def discover_units(path: Path, work: Path, units: list):
     """Append (name, root, layout, pre_findings) tuples."""
+    _discover(path, work, units, 0)
+
+
+def _discover(path: Path, work: Path, units: list, depth):
     if is_archive(path):
-        out = work / re.sub(r"[^A-Za-z0-9._-]", "_", path.name)
+        out = _unique_dir(work, path.name)
         skipped: list = []
         err = extract(path, out, skipped)
         if err:
             units.append((path.name, None, "archive", [finding("FAIL", "archive_integrity", err)]))
             return
         n0 = len(units)
-        discover_units(out, work, units)
+        _discover(out, work, units, depth + 1)
         if skipped:
             warn = finding("WARN", "unsafe_member", f"{len(skipped)} unsafe archive member(s) skipped, not extracted "
                            f"(absolute/escaping link, ../ path or special file): {skipped[:5]}",
@@ -279,8 +410,13 @@ def discover_units(path: Path, work: Path, units: list):
         return
     inner = sorted(p for p in path.rglob("*") if is_archive(p))
     if inner:
+        if depth >= MAX_NEST_DEPTH:
+            units.append((path.name, None, "archive", [finding(
+                "FAIL", "archive_integrity", f"archives nested more than {MAX_NEST_DEPTH} levels deep, "
+                f"{len(inner)} inner archive(s) not opened", missing=capped(str(p.relative_to(path)) for p in inner))]))
+            return
         for a in inner:
-            discover_units(a, work, units)
+            _discover(a, work, units, depth)
         return
     units.append((path.name, path, "unknown",
                   [finding("FAIL", "layout", "no GitHub/GitLab export layout, git repo or archive found")]))
@@ -288,9 +424,12 @@ def discover_units(path: Path, work: Path, units: list):
 
 # ---------------------------------------------------------------- generic checks
 
-def zero_byte_findings(root: Path):
+def zero_byte_findings(root: Path, layout=None):
+    """0-byte files. A plain-git checkout's working tree legitimately holds empty files (.gitignore, py.typed), so
+    there only the .git internals are judged; export layouts are all tool-written metadata and are judged whole."""
     out = []
-    for dirpath, _dirs, files in os.walk(root):
+    top = root / ".git" if layout == "plain-git" and (root / ".git").is_dir() else root
+    for dirpath, _dirs, files in os.walk(top):
         for f in files:
             p = Path(dirpath) / f
             try:
@@ -310,70 +449,105 @@ def git(bare: Path, *args, check=False, timeout=None):
                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
 
 
-def git_lines(bare: Path, *args, timeout=None):
-    """Stream git output line by line (bounded memory); raises CmdTimeout when the command overruns."""
+def git_lines(bare: Path, *args, timeout=None, ok=(0,)):
+    """Stream git output line by line (bounded memory). Raises CmdTimeout when the command overruns, Interrupted on a
+    stop request and GitError on an exit code outside `ok`: a failing command must not read as 'no output'."""
     t = timeout or git_timeout()
     what = "git " + (args[0] if args else "")
+    errf = tempfile.TemporaryFile()
     p = subprocess.Popen(["git", "-c", "safe.directory=*", "-C", str(bare), *args], stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                         stderr=errf, text=True, encoding="utf-8", errors="replace",
                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
-    fired = []
+    why = []
+    done = threading.Event()
 
-    def kill():
-        fired.append(1)
-        p.kill()
-    timer = threading.Timer(t, kill)
-    timer.start()
+    def watch():
+        deadline = time.monotonic() + t
+        while not done.wait(0.5):
+            if _STOP.is_set():
+                why.append("stop")
+            elif time.monotonic() > deadline:
+                why.append("timeout")
+            else:
+                continue
+            p.kill()
+            return
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
     try:
         for line in p.stdout:
             yield line
     finally:
-        timer.cancel()
+        done.set()
         if p.poll() is None:
             p.kill()
         p.stdout.close()
         p.wait()
-    if fired:
-        raise CmdTimeout(what, t)
+        watcher.join()
+    try:
+        if why == ["stop"]:
+            raise Interrupted(what)
+        if why:
+            raise CmdTimeout(what, t)
+        if p.returncode not in ok:
+            errf.seek(0)
+            raise GitError(what, p.returncode, errf.read().decode("utf-8", "replace"))
+    finally:
+        errf.close()
+
+
+def git_int(bare: Path, *args):
+    """Integer output of a git command that must succeed (rev-list --count ...)."""
+    r = git(bare, *args)
+    if r.returncode != 0:
+        raise GitError("git " + args[0], r.returncode, r.stderr)
+    return int(r.stdout.strip())
 
 
 def git_dir_of(p: Path):
     return p / ".git" if (p / ".git").exists() else p
 
 
+class LocUnmeasured(Exception):
+    """Lines of code could not be measured (no scc, unreadable tree, scc output unusable): said out loud, never skipped."""
+
+
+def _env_fault(err):
+    err = err.lower()
+    if "no space left" in err or "quota" in err:
+        raise EnvironmentProblem("disk_full", err.strip()[:200])
+    if "read-only file system" in err or "permission denied" in err:
+        raise EnvironmentProblem("permission", err.strip()[:200])
+
+
 def measure_loc(bare: Path, ref="HEAD"):
-    """Code lines at `ref` using scc; None when scc is absent or the tree can't be read."""
+    """Code lines at `ref` using scc. Raises LocUnmeasured when that is not possible.
+
+    The tree is checked out from the object store rather than `git archive`d (archive drops export-ignore'd paths) and
+    scc runs with every ignore mechanism off (.gitignore/.ignore/.sccignore), so the count covers what git holds."""
     if not shutil.which("scc"):
-        return None
+        raise LocUnmeasured("scc is not installed")
     t = git_timeout()
     tmp = make_tmp("loc_")
     try:
-        a = subprocess.Popen(["git", "-c", "safe.directory=*", "-C", str(bare), "archive", "--format=tar", ref],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        try:
-            tr = subprocess.run(["tar", "-x", "-C", tmp], stdin=a.stdout, capture_output=True, timeout=t)
-        except subprocess.TimeoutExpired:
-            a.kill()
-            raise CmdTimeout("tar", t) from None
-        finally:
-            a.stdout.close()
-            try:
-                a.wait(timeout=t)
-            except subprocess.TimeoutExpired:
-                a.kill()
-                a.wait()
-        err = tr.stderr.decode("utf-8", "replace").lower()
-        if "no space left" in err or "quota" in err:
-            raise EnvironmentProblem("disk_full", err.strip()[:200])
-        if "read-only file system" in err or "permission denied" in err:
-            raise EnvironmentProblem("permission", err.strip()[:200])
-        if a.returncode != 0 or tr.returncode != 0:
-            return None
-        r = run_cmd(["scc", "--format", "json", "--no-cocomo", tmp], "scc", t)
+        tree = os.path.join(tmp, "tree")
+        os.mkdir(tree)
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_INDEX_FILE": os.path.join(tmp, "index")}
+        base = ["git", "-c", "safe.directory=*", f"--git-dir={bare}", f"--work-tree={tree}"]
+        for cmd, what in (([*base, "read-tree", ref], "git read-tree"),
+                          ([*base, "checkout-index", "-a", "-f", "--prefix", tree + os.sep], "git checkout-index")):
+            r = run_cmd(cmd, what, t, env=env)
+            _env_fault(r.stderr)
+            if r.returncode != 0:
+                raise LocUnmeasured(f"{what} failed (exit {r.returncode}): {r.stderr.strip()[:200]}")
+        r = run_cmd(["scc", "--format", "json", "--no-cocomo", "--no-gitignore", "--no-ignore", "--no-scc-ignore", tree],
+                    "scc", t)
+        if r.returncode != 0:
+            raise LocUnmeasured(f"scc failed (exit {r.returncode}): {r.stderr.strip()[:200]}")
         try:
             return sum(int(x.get("Code", 0)) for x in json.loads(r.stdout))
-        except (ValueError, TypeError, AttributeError):
-            return None
+        except (ValueError, TypeError, AttributeError) as e:
+            raise LocUnmeasured(f"scc output unreadable: {type(e).__name__}") from None
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -543,15 +717,21 @@ def history_scan(bare: Path, label: str):
     return out, first_ts
 
 
-def created_vs_first_commit(label, created_at, first_ts):
-    """History older than the repo itself means the repo was created after its commits existed (import / recreation)."""
+def imported_history(created_at, first_ts):
+    """True when the first commit is older than the repository record itself (import, mirror, recreation)."""
     if not created_at or first_ts is None:
-        return []
+        return False
     try:
         c = datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).timestamp()
     except ValueError:
-        return []
-    if first_ts < c - SKEW_S:
+        return False
+    return first_ts < c - SKEW_S
+
+
+def created_vs_first_commit(label, created_at, first_ts):
+    """History older than the repo itself means the repo was created after its commits existed (import / recreation)."""
+    if imported_history(created_at, first_ts):
+        c = datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).timestamp()
         days = int((c - first_ts) // 86400)
         return [_hw(label, f"first commit is {days} day(s) older than the repository's created_at ({created_at}); "
                     "the repo was recreated or imported from existing history", item="created_after_history")]
@@ -597,6 +777,10 @@ def git_facts(bare: Path, label: str, scan_lfs=True, want_loc=False, default_bra
     except CmdTimeout as e:
         f.append(timeout_finding(label, e))
         facts = empty_facts()
+    except GitError as e:
+        # fsck passed, so a failing read means the repo could not be examined, never that it has nothing to report
+        f.append(finding("FAIL", "git_integrity", f"{label}: {e} (not verified)"))
+        facts = empty_facts()
     return f, facts
 
 
@@ -623,6 +807,8 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
         except CmdTimeout as e:
             f.append(finding("WARN", "history_forgery", f"{label}: history forgery scan not completed, {e.what} timed out "
                              f"after {e.seconds:g}s (not verified)", item="timeout"))
+        except GitError as e:
+            f.append(finding("WARN", "history_forgery", f"{label}: history forgery scan not completed, {e}", item="git_error"))
     head_ok = git(bare, "rev-parse", "--verify", "-q", "HEAD").returncode == 0
     if not refs:
         f.append(finding("WARN" if empty_ok else "FAIL", "git_integrity",
@@ -636,7 +822,9 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
     if refs:
         for m in commit_messages(bare):
             merge_prs |= {int(n) for n in re.findall(r"^Merge pull request #(\d+)", m, re.M)}
-            merge_prs |= {int(n) for n in re.findall(r"See merge request \S+!(\d+)", m)}
+            # "See merge request group/proj!N" names its project; another project's MR is not this repo's
+            merge_prs |= {int(n) for path, n in re.findall(r"See merge request (\S*?)!(\d+)", m)
+                          if not path or path.lower() == slug.lower()}
             squash_prs |= {int(n) for n in re.findall(r"\(#(\d+)\)\s*$", m.splitlines()[0])}
             for grp in CLOSE_RE.findall(m):
                 for other, n in ONE_REF.findall(grp):
@@ -648,14 +836,15 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
     if not nums:
         source = "commit-messages"
         nums = merge_prs | squash_prs
+    # for-each-ref succeeded, so these are known even for a repo with no refs (0); a failed read leaves them absent
+    metrics["branches"] = sum(1 for r in refs if r.startswith("refs/heads/"))
+    metrics["tags"] = sum(1 for r in refs if r.startswith("refs/tags/"))
     if refs:
-        metrics["commits_all"] = int(git(bare, "rev-list", "--count", "--all").stdout.strip() or 0)
-        metrics["branches"] = sum(1 for r in refs if r.startswith("refs/heads/"))
-        metrics["tags"] = sum(1 for r in refs if r.startswith("refs/tags/"))
+        metrics["commits_all"] = git_int(bare, "rev-list", "--count", "--all")
     lfs_oids = set()
     ref = f"refs/heads/{default_branch}" if default_branch and f"refs/heads/{default_branch}" in refs_map else "HEAD"
     if refs and git(bare, "rev-parse", "--verify", "-q", ref).returncode == 0:
-        metrics["commits_head"] = int(git(bare, "rev-list", "--count", ref).stdout.strip() or 0)
+        metrics["commits_head"] = git_int(bare, "rev-list", "--count", ref)
         metrics["files"] = sum(1 for _ in git_lines(bare, "ls-tree", "-r", "--name-only", ref))
         if want_loc:
             try:
@@ -663,11 +852,14 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
             except CmdTimeout as e:
                 f.append(timeout_finding(label, e))
                 metrics["loc"] = None
+            except LocUnmeasured as e:
+                f.append(finding("WARN", "loc_unmeasured", f"{label}: lines of code not measured: {e}", item="loc"))
+                metrics["loc"] = None
         if scan_lfs:
-            n = sum(1 for _ in git_lines(bare, "grep", "-l", "-I", LFS_SIG, ref, "--"))
+            n = sum(1 for _ in git_lines(bare, "grep", "-l", "-I", LFS_SIG, ref, "--", ok=(0, 1)))
             if n:
                 have = (bare / "lfs" / "objects").exists()
-                for ln in git_lines(bare, "grep", "-h", "^oid sha256:", ref, "--"):
+                for ln in git_lines(bare, "grep", "-h", "^oid sha256:", ref, "--", ok=(0, 1)):
                     m = re.search(r"oid sha256:([0-9a-f]{64})", ln)
                     if m and len(lfs_oids) < MAX_LFS_OIDS:
                         lfs_oids.add(m.group(1))
@@ -686,7 +878,11 @@ def wiki_findings(wiki: Path, root: Path):
     out = fsck_findings(wiki, label)
     if out:
         return out
-    if not any(True for _ in git_lines(wiki, "for-each-ref", "--count=1")):
+    try:
+        has_ref = any(True for _ in git_lines(wiki, "for-each-ref", "--count=1"))
+    except GitError as e:
+        return [finding("FAIL", "git_integrity", f"{label}: {e} (not verified)")]
+    if not has_ref:
         return [finding("FAIL", "git_integrity", f"{label}: wiki repository has no refs, content is missing",
                         missing=[str(wiki.relative_to(root))])]
     return []
@@ -736,7 +932,7 @@ GL_CORE_FIELDS = {  # GitLab ndjson relations
 # key present but null is fine for these (deleted accounts, optional text); absent key is not
 NULL_OK = {"user", "actor", "color"}
 PEER_EXCLUDE = {"issue", "pull_request", "commit_id", "before_commit_oid", "after_commit_oid", "label", "milestone",
-                "assignee", "message", "body", "merged_by", "closed_at", "merged_at_"}  # legitimately vary per record type
+                "assignee", "message", "body", "merged_by", "closed_at"}  # legitimately vary per record type
 USER_KEYS = {"user", "actor", "assignee", "assignees", "owner", "author", "committer", "merged_by", "closed_by",
              "reviewer", "creator", "sender", "reviewers", "requested_reviewers"}
 REPO_KEYS = {"repo", "repository", "commit_repository", "parent"}
@@ -909,6 +1105,8 @@ def missing_shas(bare: Path, shas):
         return set()
     r = run_cmd(["git", "-c", "safe.directory=*", "-C", str(bare), "cat-file", "--batch-check"], "git cat-file",
                 input="\n".join(sorted(shas)) + "\n")
+    if r.returncode != 0:
+        raise GitError("git cat-file", r.returncode, r.stderr)
     return {ln.split()[0] for ln in r.stdout.splitlines() if ln.endswith(" missing")}
 
 
@@ -946,13 +1144,18 @@ def compare_counts(label, mine, bounds, origin):
 
 
 def live_bounds(live, owner, name, label):
-    """-> ({entity: (v, v)}, [finding]); a failing API call is a FAIL (nothing was verified), never guessed."""
+    """-> ({entity: (v, v)}, [finding]). A failing API call is a FAIL (nothing was verified), never guessed; so is an
+    entity the API would not count (403/404/rate limit), which is reported per entity (`item`) instead of vanishing."""
     try:
-        api = live(owner, name)
+        api = dict(live(owner, name) or {})
     except Exception as e:  # network/auth/rate limit
         return {}, [finding("FAIL", "live_check_failed", f"{label}: live API check failed, counts NOT verified: "
                             f"{type(e).__name__}: {e}")]
-    return {k: (v, v) for k, v in (api or {}).items() if v is not None}, []
+    errs = api.pop("_errors", None) or {}
+    skipped = [(k, errs.get(k, "no answer")) for k, v in api.items() if v is None]
+    out = [finding("WARN" if k in SOFT_COUNTS else "FAIL", "live_check_failed",
+                   f"{label}: live API could not count {k}, NOT verified ({why})", item=k) for k, why in skipped]
+    return {k: (v, v) for k, v in api.items() if v is not None}, out
 
 
 def for_check_findings(fc, label, single, mine, facts, ref_pattern, entities, record_default_branch=None):
@@ -1049,6 +1252,11 @@ def ref_findings(label, before, after, archive_refs, pattern, known=True):
 def read_json(p: Path, findings):
     """-> (ok, data). Unreadable / non-UTF-8 / invalid JSON is a FAIL metadata_json finding, never a crash."""
     try:
+        size = p.stat().st_size
+        if size > max_json_bytes():
+            findings.append(finding("FAIL", "metadata_json", f"{p.name}: {size} bytes is over the {max_json_bytes()} byte "
+                                    f"limit (GARMR_MAX_JSON_BYTES), not loaded and NOT verified", missing=[p.name]))
+            return False, None
         return True, json.loads(p.read_bytes().decode("utf-8"))
     except OSError as e:
         findings.append(finding("FAIL", "metadata_json", f"{p.name}: unreadable ({type(e).__name__}: {e})", missing=[p.name]))
@@ -1303,8 +1511,10 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
     if meta_prs or (fc and fkey and any(fc.ref_snapshots(fkey))):
         S.ctx["refs_expected"] = True
     missing = sorted(pr_nums - meta_prs)
+    # a fork / mirror / migrated history carries other repos' "Merge pull request #N" lines: only a hint there
+    foreign = imported_history(r.get("created_at"), facts.get("first_commit_ts")) or bool(r.get("fork"))
     if missing:
-        f.append(finding("FAIL", "pull_requests",
+        f.append(finding("WARN" if foreign and facts["pr_source"] == "commit-messages" else "FAIL", "pull_requests",
                          f"{label}: git history has {len(pr_nums)} PR(s) ({facts['pr_source']}), "
                          f"metadata has {len(meta_prs)}; missing: {missing[:20]}{'...' if len(missing) > 20 else ''}",
                          expected=len(pr_nums), found=len(meta_prs), missing=capped(missing)))
@@ -1325,9 +1535,12 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
     marker = facts["closes"] | facts["merge_prs"] | facts["squash_prs"]
     gone = sorted(marker - issue_nums - meta_prs - (pr_nums - meta_prs))
     if gone:
-        f.append(finding("FAIL", "number_refs", f"{label}: git history refers to issue/PR #{gone[:10]} "
-                         f"(closes/merge/squash) but the export has no record of it", missing=capped(gone)))
-        note(S, "issues", f"git history says closes/merges #{gone[0]}, which no record accounts for")
+        f.append(finding("WARN" if foreign else "FAIL", "number_refs", f"{label}: git history refers to issue/PR "
+                         f"#{gone[:10]} (closes/merge/squash) but the export has no record of it"
+                         + (" (imported/fork history: the numbers may belong to another repository)" if foreign else ""),
+                         missing=capped(gone)))
+        if not foreign:
+            note(S, "issues", f"git history says closes/merges #{gone[0]}, which no record accounts for")
     every = set(issue_nums) | meta_prs
     for kind, recs in idx.get(key, {}).items():
         for x in recs:
@@ -1426,15 +1639,16 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
         mine = {"prs": len(meta_prs), "issues": m["issues"], "labels": len(labels), "milestones": len(ms),
                 "releases": len(of_repo("releases")), "issue_comments": len(of_repo("issue_comments")),
                 "review_comments": len(of_repo("pull_request_review_comments")),
-                "commit_comments": len(of_repo("commit_comments")), "branches": m.get("branches", 0),
-                "tags": m.get("tags", 0), "collaborators": collab_n, "commits": m.get("commits_head")}
+                "commit_comments": len(of_repo("commit_comments")), "branches": m.get("branches"),
+                "tags": m.get("tags"), "collaborators": collab_n, "commits": m.get("commits_head")}
         bounds = {}
         if S.live:
             bounds, live_f = live_bounds(S.live, owner, name, label)
-            f += live_f
         fc_f, fc_bounds = for_check_findings(fc, label, single, mine, facts, GITHUB_REF, COUNT_ENTITIES,
                                              r.get("default_branch"))
         f += fc_f
+        # an entity the for-check already bounds is verified by it; the live API is only the fallback
+        f += [x for x in (live_f if S.live else []) if x.get("item") not in fc_bounds]
         for src in (fc_bounds, bounds):
             for ent, kind in ENTITY_KIND.items():
                 if src.get(ent, (0, 0))[0] > 0 and mine.get(ent) == 0:
@@ -1446,29 +1660,33 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
 # ---------------------------------------------------------------- GitLab export
 
 def read_ndjson(p: Path, findings):
+    """One line at a time, so the file itself is never held in memory (the parsed records are: they are what is checked)."""
     out = []
+    bad_objs = 0
     try:
-        raw = p.read_bytes()
+        with open(p, "rb") as fh:
+            for i, line in enumerate(fh, 1):
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line.decode("utf-8"))
+                except ValueError as e:
+                    findings.append(finding("FAIL", "metadata_json", f"{p.name}:{i}: bad JSON ({e})", missing=[p.name]))
+                    break
+                if isinstance(rec, dict):
+                    out.append(rec)
+                else:
+                    bad_objs += 1
     except OSError as e:
         findings.append(finding("FAIL", "metadata_json", f"{p.name}: unreadable ({type(e).__name__}: {e})", missing=[p.name]))
         return out
-    bad_objs = 0
-    for i, line in enumerate(raw.split(b"\n"), 1):
-        if not line.strip():
-            continue
-        try:
-            rec = json.loads(line.decode("utf-8"))
-        except ValueError as e:
-            findings.append(finding("FAIL", "metadata_json", f"{p.name}:{i}: bad JSON ({e})", missing=[p.name]))
-            break
-        if isinstance(rec, dict):
-            out.append(rec)
-        else:
-            bad_objs += 1
     if bad_objs:
         findings.append(finding("FAIL", "metadata_json", f"{p.name}: {bad_objs} line(s) are not JSON objects",
                                 missing=[p.name]))
     return out
+
+
+UPLOAD_RE = re.compile(r"/uploads/([0-9a-f]{32})/([^)\s\"'\\]+)")
 
 
 def find_bundle(root: Path):
@@ -1503,8 +1721,15 @@ def check_gitlab(root: Path, work: Path, scan_lfs, want_loc, fallback_name, fc=N
         if gaps:
             f.append(finding("FAIL", "record_incomplete", f"{rel}: {len(gaps)} field(s) missing from records, e.g. "
                              f"{gaps[:3]}", missing=capped(gaps), item=rel))
-    raw_text = "".join(p.read_text(encoding="utf-8", errors="replace") for p in tree.glob("*.ndjson"))
-    ups = sorted({f"uploads/{h}/{n}" for h, n in re.findall(r"/uploads/([0-9a-f]{32})/([^)\s\"'\\]+)", raw_text)})
+    found_ups: set = set()
+    for nd_path in tree.glob("*.ndjson"):
+        try:
+            with open(nd_path, "r", encoding="utf-8", errors="replace") as fh:
+                for ln in fh:
+                    found_ups |= {f"uploads/{h}/{n}" for h, n in re.findall(UPLOAD_RE, ln)}
+        except OSError:
+            continue        # already reported as unreadable by read_ndjson
+    ups = sorted(found_ups)
     lost = [u for u in ups if not file_exists(root, u)]
     if lost:
         f.append(finding("FAIL", "file_refs", f"{len(lost)} upload(s) referenced by issues/MRs/notes are not in the "
@@ -1547,16 +1772,19 @@ def check_gitlab(root: Path, work: Path, scan_lfs, want_loc, fallback_name, fc=N
         have = {x.get("iid") for x in nd.get("merge_requests", [])}
         rec["metrics"]["prs_git"], rec["metrics"]["prs_meta"] = len(facts["pr_numbers"]), len(have)
         missing = sorted(facts["pr_numbers"] - have)
+        foreign = imported_history(pj.get("created_at"), facts.get("first_commit_ts"))
         if missing:
-            f.append(finding("FAIL", "merge_requests",
+            f.append(finding("WARN" if foreign and facts["pr_source"] == "commit-messages" else "FAIL", "merge_requests",
                              f"git history has {len(facts['pr_numbers'])} MR(s) ({facts['pr_source']}), "
                              f"metadata has {len(have)}; missing: {missing[:20]}",
                              expected=len(facts["pr_numbers"]), found=len(have), missing=capped(missing)))
         iids = {x.get("iid") for x in nd.get("issues", [])} | have
         gone = sorted((facts["closes"] | facts["merge_prs"]) - iids - facts["pr_numbers"])
         if gone:
-            f.append(finding("FAIL", "number_refs", f"git history refers to issue/MR #{gone[:10]} (closes/merge) but "
-                             f"the export has no record of it", missing=capped(gone)))
+            f.append(finding("WARN" if foreign else "FAIL", "number_refs", f"git history refers to issue/MR "
+                             f"#{gone[:10]} (closes/merge) but the export has no record of it"
+                             + (" (imported history: the numbers may belong to another project)" if foreign else ""),
+                             missing=capped(gone)))
     lost_lfs = sorted(o for o in listed_oids if o not in lfs_files)
     if lost_lfs:
         f.append(finding("FAIL", "file_refs", f"{len(lost_lfs)} LFS object(s) listed by metadata or pointed at by git "
@@ -1632,7 +1860,7 @@ def _analyse_unit(uf, repos, name, root, layout, work, live, scan_lfs, want_loc,
         return
     usable = fc if fc and not fc.error else None
     ctx: dict = {}
-    zero = zero_byte_findings(root)
+    zero = zero_byte_findings(root, layout)
     uf += zero
     if layout == "github-migration":
         more, recs = check_github(root, live, scan_lfs, want_loc, fc, ctx)
@@ -1717,23 +1945,30 @@ def github_live(token, api_base="https://api.github.com"):
         m = re.search(r'[?&]page=(\d+)>; rel="last"', hdr.get("Link", "") or "")
         return int(m.group(1)) if m else len(data)
 
-    def safe(fn, *a):
+    errors: dict = {}
+
+    def safe(name, fn, *a):
         try:
             return fn(*a)
-        except Exception:  # no access / not enabled: skip that entity rather than guess
+        except Exception as e:  # no access / not enabled / rate limited: reported per entity, never counted as a pass
+            errors[name] = f"{type(e).__name__}: {e}"[:200]
             return None
 
     def live(owner, repo):
+        errors.clear()
         base = f"/repos/{owner}/{repo}"
-        return {"prs": search(owner, repo, "pr"), "issues": search(owner, repo, "issue"),
-                "labels": count_list(f"{base}/labels"), "milestones": count_list(f"{base}/milestones?state=all"),
-                "releases": count_list(f"{base}/releases"),
-                "issue_comments": safe(count_list, f"{base}/issues/comments"),
-                "review_comments": safe(count_list, f"{base}/pulls/comments"),
-                "commit_comments": safe(count_list, f"{base}/comments"),
-                "branches": safe(count_list, f"{base}/branches"), "tags": safe(count_list, f"{base}/tags"),
-                "collaborators": safe(count_list, f"{base}/collaborators?affiliation=all"),
-                "commits": safe(last_page, f"{base}/commits")}
+        out = {"prs": search(owner, repo, "pr"), "issues": search(owner, repo, "issue"),
+               "labels": count_list(f"{base}/labels"), "milestones": count_list(f"{base}/milestones?state=all"),
+               "releases": count_list(f"{base}/releases"),
+               "issue_comments": safe("issue_comments", count_list, f"{base}/issues/comments"),
+               "review_comments": safe("review_comments", count_list, f"{base}/pulls/comments"),
+               "commit_comments": safe("commit_comments", count_list, f"{base}/comments"),
+               "branches": safe("branches", count_list, f"{base}/branches"),
+               "tags": safe("tags", count_list, f"{base}/tags"),
+               "collaborators": safe("collaborators", count_list, f"{base}/collaborators?affiliation=all"),
+               "commits": safe("commits", last_page, f"{base}/commits")}
+        out["_errors"] = dict(errors)
+        return out
     return live
 
 
