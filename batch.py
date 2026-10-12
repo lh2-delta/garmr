@@ -56,7 +56,8 @@ BRANCH_DIFF_PCT = 25
 
 REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "for_check",
                "commits_head",
-               "commits_all", "prs_git", "prs_meta", "labels", "issues", "branches", "tags", "files", "loc",
+               "commits_all", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "prs_open", "visibility", "labels", "issues",
+               "branches", "tags", "files", "loc",
                "org_csv_row", "org_commits", "org_loc", "org_prs", "org_branches", "org_tags", "org_files", "flags"]
 MISSING_COLS = ["repo", "provider", "archive", "check", "item", "expected", "found", "missing_count",
                 "missing_items", "detail"]
@@ -747,7 +748,9 @@ def build_rows(rec, st):
         "warned_checks": ";".join(sorted({x["check"] for x in warns})),
         "failed_checks": ";".join(sorted({x["check"] for x in fails})), "for_check": rec["for_check"],
         "commits_head": m.get("commits_head", ""), "commits_all": m.get("commits_all", ""),
-        "prs_git": m.get("prs_git", ""), "prs_meta": m.get("prs_meta", ""), "labels": m.get("labels", ""),
+        "prs_git": m.get("prs_git", ""), "prs_meta": m.get("prs_meta", ""),
+        "prs_merged": m.get("prs_merged", ""), "prs_unmerged": m.get("prs_unmerged", ""),
+        "prs_open": m.get("prs_open", ""), "visibility": m.get("visibility") or "unknown", "labels": m.get("labels", ""),
         "issues": m.get("issues", ""), "branches": m.get("branches", ""), "tags": m.get("tags", ""),
         "files": m.get("files", ""), "loc": "" if m.get("loc") is None else m["loc"],
         "org_csv_row": row_state, **{f"org_{k}": ("" if vals.get(k) is None else vals[k]) for k in ORG_METRICS},

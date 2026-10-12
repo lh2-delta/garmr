@@ -934,6 +934,70 @@ def num_of(url):
     return int(m.group(1)) if m else None
 
 
+VISIBILITIES = ("public", "private", "internal")
+GL_VISIBILITY_LEVEL = {0: "private", 10: "internal", 20: "public"}
+
+
+def visibility_of(rec):
+    """public / private / internal / unknown from one repository record (GitHub `private`, GitLab `visibility` /
+    `visibility_level`, Bitbucket `is_private`). Anything absent or unrecognised is `unknown`, never a guess."""
+    if not isinstance(rec, dict):
+        return "unknown"
+    v = rec.get("visibility")
+    if isinstance(v, str) and v.strip().lower() in VISIBILITIES:
+        return v.strip().lower()
+    lvl = rec.get("visibility_level")
+    if isinstance(lvl, str) and lvl.strip().isdigit():
+        lvl = int(lvl)
+    if isinstance(lvl, int) and not isinstance(lvl, bool) and lvl in GL_VISIBILITY_LEVEL:
+        return GL_VISIBILITY_LEVEL[lvl]
+    for k in ("is_private", "private"):
+        if isinstance(rec.get(k), bool):
+            return "private" if rec[k] else "public"
+    return "unknown"
+
+
+def visibility_findings(label, mine, others):
+    """WARN when the archive's visibility is known and a for-check / live API value (others: [(origin, value)]) is
+    known and different. Informational: a missing value on either side is skipped silently."""
+    if mine not in VISIBILITIES:
+        return []
+    return [finding("WARN", "visibility_mismatch", f"{label}: archive record says {mine}, {origin} says {theirs}",
+                    expected=theirs, found=mine, item=origin)
+            for origin, theirs in others if theirs in VISIBILITIES and theirs != mine]
+
+
+def pr_categories(recs, number):
+    """-> {merged, unmerged, open} counts of distinct numbered PR/MR records, or None when there are none or one
+    carries none of merged_at / closed_at / state (its status would be a guess). Duplicates count once, at their
+    most advanced status (merged > unmerged > open)."""
+    best = {}
+    for p in recs:
+        n = number(p)
+        if n is None:
+            continue
+        has = [k for k in ("merged_at", "closed_at", "state") if k in p]
+        if not has:
+            return None
+        state = str(p.get("state") or "").strip().lower()
+        if str_of(p.get("merged_at")).strip() or state == "merged":
+            cat = 2
+        elif str_of(p.get("closed_at")).strip() or state == "closed":
+            cat = 1
+        else:
+            cat = 0
+        best[n] = max(best.get(n, 0), cat)
+    if not best:
+        return None
+    vals = list(best.values())
+    return {"merged": vals.count(2), "unmerged": vals.count(1), "open": vals.count(0)}
+
+
+def set_pr_categories(m, cats):
+    if cats:
+        m["prs_merged"], m["prs_unmerged"], m["prs_open"] = cats["merged"], cats["unmerged"], cats["open"]
+
+
 class CappedList(list):
     total = 0
 
@@ -1221,7 +1285,7 @@ def compare_counts(label, mine, bounds, origin):
     return out
 
 
-def live_bounds(live, owner, name, label):
+def live_bounds(live, owner, name, label, side=None):
     """-> ({entity: (v, v)}, [finding]). A failing API call is a FAIL (nothing was verified), never guessed; so is an
     entity the API would not count (403/404/rate limit), which is reported per entity (`item`) instead of vanishing."""
     try:
@@ -1230,6 +1294,9 @@ def live_bounds(live, owner, name, label):
         return {}, [finding("FAIL", "live_check_failed", f"{label}: live API check failed, counts NOT verified: "
                             f"{type(e).__name__}: {e}")]
     errs = api.pop("_errors", None) or {}
+    vis = api.pop("visibility", None)    # a string, informational: not a count and never a live_check_failed
+    if side is not None:
+        side["visibility"] = vis
     skipped = [(k, errs.get(k, "no answer")) for k, v in api.items() if v is None]
     out = [finding("WARN" if k in SOFT_COUNTS else "FAIL", "live_check_failed",
                    f"{label}: live API could not count {k}, NOT verified ({why})", item=k) for k, why in skipped]
@@ -1573,6 +1640,8 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
         out = list(idx.get(key, {}).get(kind, []))
         return out + idx.get(None, {}).get(kind, []) if single else out
 
+    vis = visibility_of(r)
+    rec["metrics"]["visibility"] = vis
     bare = S.present.get(f"{owner}/{name}".lower())
     if bare is None:
         rel = f"repositories/{owner}/{name}.git"
@@ -1586,9 +1655,10 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
     gf, facts = git_facts(bare, label, S.scan_lfs, S.want_loc, r.get("default_branch"), empty_ok, label)
     f += gf
     f += created_vs_first_commit(label, r.get("created_at"), facts.get("first_commit_ts"))
-    m = rec["metrics"] = dict(facts["metrics"])
+    m = rec["metrics"] = dict(facts["metrics"], visibility=vis)
     prs = of_repo("pull_requests")
     meta_prs = {n for n in (num_of(p.get("url")) or int_or_none(p.get("number")) for p in prs) if n is not None}
+    set_pr_categories(m, pr_categories(prs, lambda p: num_of(p.get("url")) or int_or_none(p.get("number"))))
     pr_nums = facts["pr_numbers"]
     m["prs_git"], m["prs_meta"] = len(pr_nums), len(meta_prs)
     if meta_prs or (fc and fkey and any(fc.ref_snapshots(fkey))):
@@ -1735,12 +1805,16 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
                 "review_comments": len(of_repo("pull_request_review_comments")),
                 "commit_comments": len(of_repo("commit_comments")), "branches": m.get("branches"),
                 "tags": m.get("tags"), "collaborators": collab_n, "commits": m.get("commits_head")}
-        bounds = {}
+        bounds, side = {}, {}
         if S.live:
-            bounds, live_f = live_bounds(S.live, owner, name, label)
+            bounds, live_f = live_bounds(S.live, owner, name, label, side)
         fc_f, fc_bounds = for_check_findings(fc, label, single, mine, facts, GITHUB_REF, COUNT_ENTITIES,
                                              r.get("default_branch"))
         f += fc_f
+        others = [("live API", side.get("visibility"))]
+        if fc and fkey:
+            others.append(("for-check", fc.source_visibility(fkey)))
+        f += visibility_findings(label, vis, others)
         # an entity the for-check already bounds is verified by it; the live API is only the fallback
         f += [x for x in (live_f if S.live else []) if x.get("item") not in fc_bounds]
         for src in (fc_bounds, bounds):
@@ -1804,7 +1878,8 @@ def check_gitlab(root: Path, work: Path, scan_lfs, want_loc, fallback_name, fc=N
             ok, data = read_json(pj_path, f)
             pj = data if ok and isinstance(data, dict) else {}
     label = str_of(pj.get("path_with_namespace")) or str_of(pj.get("name")) or fallback_name
-    rec = {"repo": label, "provider": "gitlab", "findings": f, "metrics": {}}
+    vis = visibility_of(pj)
+    rec = {"repo": label, "provider": "gitlab", "findings": f, "metrics": {"visibility": vis}}
     tree = root / "tree" / "project"
     if not tree.is_dir():
         f.append(finding("FAIL", "metadata", "tree/project/ missing"))
@@ -1856,12 +1931,13 @@ def check_gitlab(root: Path, work: Path, scan_lfs, want_loc, fallback_name, fc=N
                                          f"may be incomplete: {fr.stderr.strip()[:200]}"))
                     gf, facts = git_facts(clone, bundle.name, scan_lfs, want_loc, slug=label)
                     f += [x for x in gf if x["check"] != "lfs"]  # GitLab exports carry LFS objects: judged below
-                    rec["metrics"] = dict(facts["metrics"])
+                    rec["metrics"] = dict(facts["metrics"], visibility=vis)
                     listed_oids |= facts["lfs_oids"]
             except CmdTimeout as e:
                 f.append(timeout_finding(bundle.name, e))
         finally:
             shutil.rmtree(holder, ignore_errors=True)
+    set_pr_categories(rec["metrics"], pr_categories(nd.get("merge_requests", []), lambda x: int_or_none(x.get("iid"))))
     if facts:
         have = {x.get("iid") for x in nd.get("merge_requests", [])}
         rec["metrics"]["prs_git"], rec["metrics"]["prs_meta"] = len(facts["pr_numbers"]), len(have)
@@ -1908,6 +1984,9 @@ def check_gitlab(root: Path, work: Path, scan_lfs, want_loc, fallback_name, fc=N
             "milestones": len(nd.get("milestones", [])), "releases": len(nd.get("releases", [])),
             "branches": m.get("branches"), "tags": m.get("tags"), "commits": m.get("commits_head")}
     f += for_check_findings(fc, label, True, mine, facts or {}, GITLAB_REF, GITLAB_ENTITIES, pj.get("default_branch"))[0]
+    fkey = fc.match_repo(label, True) if fc and not fc.error else None
+    if fkey:
+        f += visibility_findings(label, vis, [("for-check", fc.source_visibility(fkey))])
     return uf, [rec]
 
 
@@ -2048,6 +2127,9 @@ def github_live(token, api_base="https://api.github.com"):
             errors[name] = f"{type(e).__name__}: {e}"[:200]
             return None
 
+    def repo_visibility(base):
+        return visibility_of(call(base)[0])
+
     def live(owner, repo):
         errors.clear()
         base = f"/repos/{owner}/{repo}"
@@ -2060,7 +2142,8 @@ def github_live(token, api_base="https://api.github.com"):
                "branches": safe("branches", count_list, f"{base}/branches"),
                "tags": safe("tags", count_list, f"{base}/tags"),
                "collaborators": safe("collaborators", count_list, f"{base}/collaborators?affiliation=all"),
-               "commits": safe("commits", last_page, f"{base}/commits")}
+               "commits": safe("commits", last_page, f"{base}/commits"),
+               "visibility": safe("visibility", repo_visibility, base)}
         out["_errors"] = dict(errors)
         return out
     return live

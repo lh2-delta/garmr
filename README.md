@@ -79,7 +79,7 @@ All files are created mode `0600` (owner only), since they list repo names and w
 
 | File | Contents |
 |---|---|
-| `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `for_check` (`yes` / `no` / `unreadable` / `empty`), counts found in the archive, the org's numbers, `flags` |
+| `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `for_check` (`yes` / `no` / `unreadable` / `empty`), counts found in the archive, the org's numbers, `flags`. `visibility`: `public` / `private` / `internal` / `unknown`, read from the repository record (GitHub `private`, GitLab `visibility` / `visibility_level` 20 / 10 / 0, Bitbucket `is_private`); `unknown` when the record lacks it, is unreadable or the layout is plain git, never guessed. `prs_merged` / `prs_unmerged` / `prs_open`: counts of distinct PR (GitHub) / MR (GitLab) records in the metadata. merged = non-empty `merged_at`; unmerged = not merged but closed (non-empty `closed_at`, or state `closed`); open = neither. `state` is only the fallback (GitHub export records carry none). A number with several records counts once, at its most advanced status. The three are blank (not 0) when the export carries no PR/MR records, the layout has none (plain git), or a record has none of `merged_at` / `closed_at` / `state`. `prs_git` and `prs_meta` are unchanged |
 | `missing_items.csv` | only errors: one row per failed check with `expected`, `found`, `missing_count`, `missing_items` (e.g. PR numbers in git but with no metadata record). `missing_items` lists at most 200 examples; `missing_count` is always the real total |
 | `run_notes.txt` | non-fatal notices: CSVs skipped or unused, `.xlsx` files not read, archives that were not checked |
 
@@ -192,6 +192,7 @@ New checks (all FAIL unless noted; `item` is the value in `missing_items.csv`):
 | `live_counts` / `<entity>` | the archive holds fewer than the lower bound (see below); `missing_count` is the shortfall. More than the upper bound only warns. Same check name as the live API comparison |
 | `refs` | a ref on the source both before and after the export is not in the archive's git. Same ref at another sha only warns |
 | `default_branch` / `source` (WARN) | source default branch differs from the archive's repository record |
+| `visibility_mismatch` (WARN) | the archive record's visibility is known and a `visibility` count row of the for-check (`counts_before` / `counts_after`; value `public` / `private` / `internal`), or the GitHub API with `GITHUB_TOKEN`, states a different one; `item` names the source (`for-check` / `live API`). Informational: a missing value on either side is skipped silently |
 
 `file_listing` runs only for `.tar.gz` / `.tgz` / `.tar`, against the extraction root (a single wrapper folder is tolerated);
 extra files in the archive are fine. GitHub compares `refs/heads/*`, `refs/tags/*`, `refs/pull/N/head`; GitLab only heads and
