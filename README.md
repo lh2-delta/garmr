@@ -80,7 +80,7 @@ All files are created mode `0600` (owner only), since they list repo names and w
 | File | Contents |
 |---|---|
 | `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `for_check` (`yes` / `no` / `unreadable` / `empty`), counts found in the archive, the org's numbers, `flags` |
-| `missing_items.csv` | only errors: one row per failed check with `expected`, `found`, `missing_count`, `missing_items` (e.g. PR numbers in git but with no metadata record) |
+| `missing_items.csv` | only errors: one row per failed check with `expected`, `found`, `missing_count`, `missing_items` (e.g. PR numbers in git but with no metadata record). `missing_items` lists at most 200 examples; `missing_count` is always the real total |
 | `run_notes.txt` | non-fatal notices: CSVs skipped or unused, `.xlsx` files not read, archives that were not checked |
 
 While running, `*.partial` files grow one archive at a time and survive a crash, so a long run is not lost. The final
@@ -132,7 +132,7 @@ Provider is auto-detected per archive: `github-migration` (`schema.json`/`reposi
 | `git_integrity` | `git fsck` finds a missing object, repo is shallow, or has no refs |
 | `pull_requests` / `merge_requests` | a PR/MR in git (`refs/pull/*`, `refs/merge-requests/*`, else merge-commit messages) has no record |
 | `number_refs` | a commit says `closes/fixes/resolves #N` or merges/squashes `#N` but no issue/PR record N exists (plain `#N` mentions are ignored) |
-| `pr_state` | git has `Merge pull request #N` but the PR record has no `merged_at` |
+| `pr_state` | git has `Merge pull request #N` but the PR record has no `merged_at`. Only a WARN when the merge commit predates the repo's `created_at`, or names a head branch (`from owner/branch`) other than the PR record's `head.ref`: after an import the numbers belong to the repo's earlier life and collide with this repo's own PRs |
 | `git_refs` | a PR record has no `refs/pull/N/head` in the archive's git |
 | `release_tag` / `default_branch` | a release's tag, or the repo's default branch, is not in the archive's git |
 | `commits` | a commit sha in the metadata (merge, event, comment commit) is not in the archive's git (PR base/head shas only warn) |
@@ -141,7 +141,7 @@ Provider is auto-detected per archive: `github-migration` (`schema.json`/`reposi
 
 | Check | Fails when |
 |---|---|
-| `record_incomplete` | a record lacks fields its kind requires (e.g. a PR with no `title` / `head.sha`), or lacks a field its peers all have |
+| `record_incomplete` | a record lacks fields its kind requires (e.g. a PR with no `title` / `head.sha`), or lacks a field its peers all have. Peers are the records of the same sub-kind: issue events are grouped by `event` and attachments by which parent key they carry, so fields legitimately specific to one type (e.g. `commit_repository` on `referenced` events) are not flagged. `missing_count` is the real number of fields |
 | `dangling_reference` | a user a record points at is not in `users_*.json` (missing fork repos only warn) |
 | `labels` / `milestones` / `comments_parent` / `events_parent` | an issue/PR references a label/milestone that was not exported, or a comment/event points at an issue/PR with no record |
 | `repo_git` | repo listed in metadata but its `.git` is missing |
@@ -218,7 +218,7 @@ Further checks, all FAIL unless noted (`item` is the value in `missing_items.csv
 | `for_check_unmatched` | a for-check row set matches no archive/repo |
 | `live_check_failed` | `GITHUB_TOKEN` is set but the API comparison could not be completed, or the API would not count one entity (403/404/rate limit): one finding per entity in `item` (WARN for `collaborators`, which needs push access) |
 | `repo_unlisted` | a repository is in the archive but not in its repository metadata (or the reverse) |
-| `kind_missing` | a metadata kind that must exist is absent |
+| `kind_missing` | a metadata kind that must exist is absent. For `pull_requests`, a WARN instead of a FAIL when the only evidence is PR numbers in commit messages and the history is imported (first commit older than the repo's `created_at`, or a fork) |
 | `timeout` | a git / `scc` / fsck call exceeded `GARMR_GIT_TIMEOUT` / `GARMR_FSCK_TIMEOUT` (except the history-forgery scan: WARN) |
 | `archive_integrity` | the archive does not read, would expand past an extraction cap or the free disk, or nests archives more than 3 levels deep |
 | `git_integrity` | also when a git read that must succeed (`rev-list`, `for-each-ref`...) fails after fsck passed: the repo is reported not verified, never as having nothing to report |
