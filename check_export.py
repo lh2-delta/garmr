@@ -968,34 +968,27 @@ def visibility_findings(label, mine, others):
 
 
 def pr_categories(recs, number):
-    """-> {merged, unmerged, open} counts of distinct numbered PR/MR records, or None when there are none or one
-    carries none of merged_at / closed_at / state (its status would be a guess). Duplicates count once, at their
-    most advanced status (merged > unmerged > open)."""
-    best = {}
+    """-> {merged, unmerged} counts of distinct numbered PR/MR records, or None when there are none or one carries
+    none of merged_at / closed_at / state (its status would be a guess). `unmerged` is everything not merged, closed
+    without a merge and still open alike: a consumer comparing against merged PRs only needs that split. Duplicates
+    count once, as merged if any of them is."""
+    merged = {}
     for p in recs:
         n = number(p)
         if n is None:
             continue
-        has = [k for k in ("merged_at", "closed_at", "state") if k in p]
-        if not has:
+        if not any(k in p for k in ("merged_at", "closed_at", "state")):
             return None
-        state = str(p.get("state") or "").strip().lower()
-        if str_of(p.get("merged_at")).strip() or state == "merged":
-            cat = 2
-        elif str_of(p.get("closed_at")).strip() or state == "closed":
-            cat = 1
-        else:
-            cat = 0
-        best[n] = max(best.get(n, 0), cat)
-    if not best:
+        is_merged = bool(str_of(p.get("merged_at")).strip()) or str(p.get("state") or "").strip().lower() == "merged"
+        merged[n] = merged.get(n, False) or is_merged
+    if not merged:
         return None
-    vals = list(best.values())
-    return {"merged": vals.count(2), "unmerged": vals.count(1), "open": vals.count(0)}
+    return {"merged": sum(merged.values()), "unmerged": len(merged) - sum(merged.values())}
 
 
 def set_pr_categories(m, cats):
     if cats:
-        m["prs_merged"], m["prs_unmerged"], m["prs_open"] = cats["merged"], cats["unmerged"], cats["open"]
+        m["prs_merged"], m["prs_unmerged"] = cats["merged"], cats["unmerged"]
 
 
 class CappedList(list):

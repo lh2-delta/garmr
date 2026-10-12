@@ -9,7 +9,7 @@ import check_export as ce  # noqa: E402
 from conftest import build_github_tree, tar_it  # noqa: E402
 
 REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "for_check", "commits_head",
-               "commits_all", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "prs_open", "visibility", "labels", "issues",
+               "commits_all", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "visibility", "labels", "issues",
                "branches", "tags", "files", "loc",
                "org_csv_row", "org_commits", "org_loc", "org_prs", "org_branches", "org_tags", "org_files", "flags"]
 MISSING_COLS = ["repo", "provider", "archive", "check", "item", "expected", "found", "missing_count",

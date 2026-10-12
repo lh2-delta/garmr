@@ -1,4 +1,4 @@
-"""completeness_report.csv columns `visibility` and `prs_merged` / `prs_unmerged` / `prs_open`."""
+"""completeness_report.csv columns `visibility` and `prs_merged` / `prs_unmerged`."""
 import csv
 import json
 import sys
@@ -62,7 +62,7 @@ def test_plain_git_is_unknown_and_pr_columns_blank(tmp_path):
     tree = build_github_tree(tmp_path / "tree")
     row = run_report(tmp_path, tree / "repositories" / "acme", "plain.tar.gz")     # bare repo only: no metadata
     assert row["visibility"] == "unknown"
-    assert row["prs_merged"] == row["prs_unmerged"] == row["prs_open"] == ""
+    assert row["prs_merged"] == row["prs_unmerged"] == ""
 
 
 def test_visibility_mismatch_with_live_api_and_for_check(tmp_path):
@@ -97,7 +97,7 @@ def test_gitlab_visibility_mismatch_with_for_check(tmp_path):
 
 def prs_of(rec):
     m = rec["metrics"]
-    return tuple(m.get(k) for k in ("prs_merged", "prs_unmerged", "prs_open"))
+    return tuple(m.get(k) for k in ("prs_merged", "prs_unmerged"))
 
 
 def test_github_pr_categories_from_dates(tmp_path):
@@ -106,7 +106,8 @@ def test_github_pr_categories_from_dates(tmp_path):
                    {"merged_at": None, "closed_at": "2025-02-02T00:00:00Z"},
                    {"merged_at": None, "closed_at": None}])
     rec = repo_of(root)
-    assert prs_of(rec) == (1, 1, 1)
+    assert prs_of(rec) == (1, 2)  # unmerged = closed without a merge + still open
+    assert "prs_open" not in rec["metrics"]
     assert rec["metrics"]["prs_meta"] == 3 and rec["metrics"]["prs_git"] == 3
 
 
@@ -115,26 +116,26 @@ def test_empty_strings_are_not_dates_and_state_is_fallback(tmp_path):
     set_prs(root, [{"merged_at": "", "closed_at": "", "state": "closed"},
                    {"merged_at": "", "closed_at": ""},
                    {"state": "open"}])
-    assert prs_of(repo_of(root)) == (0, 1, 2)
+    assert prs_of(repo_of(root)) == (0, 3)
 
 
-def test_duplicate_pr_records_count_once_at_most_advanced_status(tmp_path):
+def test_duplicate_pr_records_count_once_as_merged_if_any_is(tmp_path):
     root = build_github_tree(tmp_path / "t", prs=(1, 2), pr_meta=[1, 1, 2])
     set_prs(root, [{"merged_at": None, "closed_at": None}, {"merged_at": "2025-02-01T00:00:00Z"},
                    {"merged_at": None, "closed_at": None}])
     rec = repo_of(root)
-    assert prs_of(rec) == (1, 0, 1) and rec["metrics"]["prs_meta"] == 2
+    assert prs_of(rec) == (1, 1) and rec["metrics"]["prs_meta"] == 2
 
 
 def test_no_pr_records_leaves_blank_not_zero(tmp_path):
     root = build_github_tree(tmp_path / "t", prs=(), pr_meta=[])
     (root / "pull_requests_000001.json").unlink()
-    assert prs_of(repo_of(root)) == (None, None, None)
+    assert prs_of(repo_of(root)) == (None, None)
 
 
-def test_record_with_no_status_fields_is_unknown_not_open(tmp_path):
+def test_record_with_no_status_fields_is_unknown_not_unmerged(tmp_path):
     root = build_github_tree(tmp_path / "t")          # fixture PRs carry none of merged_at/closed_at/state
-    assert prs_of(repo_of(root)) == (None, None, None)
+    assert prs_of(repo_of(root)) == (None, None)
 
 
 def test_gitlab_mr_categories(tmp_path):
@@ -146,7 +147,7 @@ def test_gitlab_mr_categories(tmp_path):
     recs[2].update(state="opened")
     recs[3].update(state="closed", closed_at=None)
     f.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
-    assert prs_of(repo_of(root, "gitlab-export")) == (1, 2, 1)
+    assert prs_of(repo_of(root, "gitlab-export")) == (1, 3)
 
 
 def test_report_csv_carries_new_columns(tmp_path):
@@ -155,5 +156,6 @@ def test_report_csv_carries_new_columns(tmp_path):
     set_prs(tree, [{"merged_at": "2025-02-01T00:00:00Z"}, {"closed_at": "2025-02-01T00:00:00Z", "merged_at": None},
                    {"merged_at": None, "closed_at": None}])
     row = run_report(tmp_path, tree)
-    assert (row["visibility"], row["prs_merged"], row["prs_unmerged"], row["prs_open"]) == ("public", "1", "1", "1")
+    assert (row["visibility"], row["prs_merged"], row["prs_unmerged"]) == ("public", "1", "2")
+    assert "prs_open" not in row
     assert row["prs_git"] == "3" and row["prs_meta"] == "3"
