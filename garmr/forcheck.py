@@ -256,13 +256,26 @@ def object_totals(bases) -> tuple[int, int]:
     return count, size
 
 
+def _inside(base: Path, rel: str):
+    """base/rel, or None when the for-check's path is absolute or resolves outside the extraction root (a hostile or
+    corrupt listing must not make Garmr stat files elsewhere on the host)."""
+    if not rel or rel.startswith("/") or "\x00" in rel:
+        return None
+    p = base / rel
+    try:
+        p.resolve().relative_to(base.resolve())
+    except (ValueError, OSError, RuntimeError):
+        return None
+    return p
+
+
 def file_listing_findings(fc: ForCheck, archive: Path, extract_root: Path):
     if not archive.name.lower().endswith(TAR_SUFFIXES) or not extract_root.is_dir():
         return []
     bases, out = _bases(extract_root), []
     missing, resized = [], []
     for rel, size in sorted(fc.files.items()):
-        found = next((b / rel for b in bases if (b / rel).is_file()), None)
+        found = next((c for b in bases for c in [_inside(b, rel)] if c is not None and c.is_file()), None)
         if found is None:
             missing.append(rel)
         elif size is not None and found.stat().st_size != size:

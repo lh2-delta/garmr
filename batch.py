@@ -48,7 +48,9 @@ OUTPUT_DIR = "/data/output"
 WORK_DIR = "/data/work"
 
 SCRATCH_PREFIX = "garmr-"
-SPACE_FACTOR = 1.2
+# the extracted tree (1.2x the archive) coexists with a bare clone of a GitLab bundle and with the LOC checkout of HEAD,
+# each about the archive's size, so the largest archive needs this much free work space
+SPACE_FACTOR = 3.2
 MAX_ZIP_DEPTH = 2
 BRANCH_DIFF_PCT = 25
 
@@ -149,12 +151,20 @@ def to_int(v):
 _NUMERIC = re.compile(r"^[+-]?\d+(\.\d+)?$")
 
 
-def csv_safe(v):
-    """Neutralise spreadsheet formulas and embedded newlines in text cells; numbers pass through."""
+_ID_CELL = re.compile(r"^[-A-Za-z0-9._/:!]+$")
+ID_COLS = ("repo", "archive")
+
+
+def csv_safe(v, identifier=False):
+    """Neutralise spreadsheet formulas and embedded newlines in text cells; numbers pass through.
+
+    `identifier` cells (repo, archive) are join keys for downstream consumers, so a name that merely starts with '-'
+    (a legal repo name) stays byte-identical; anything with characters a repo/file name never needs is still escaped."""
     if not isinstance(v, str):
         return v
     if v[:1] in ("=", "+", "-", "@", "\t", "\r") and not _NUMERIC.match(v):
-        v = "'" + v
+        if not (identifier and v[:1] == "-" and _ID_CELL.match(v)):
+            v = "'" + v
     return v.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
 
 
@@ -197,7 +207,7 @@ class Sink:
 
     @staticmethod
     def _clean(row):
-        return {k: csv_safe(v) for k, v in row.items()}
+        return {k: csv_safe(v, k in ID_COLS) for k, v in row.items()}
 
     def sync(self):
         for f in (self.rf, self.mf):
@@ -410,15 +420,21 @@ def compare_metrics(org, row, metrics, tolerance_pct):
         if m == "commits":
             hi, lo = metrics.get("commits_all"), metrics.get("commits_head")
             if hi is None:
+                flags.append("ORG_UNCOMPARED:commits")
                 continue
             found = hi
             lower_than = lo if lo is not None else hi
         elif m == "prs":
-            found = max(metrics.get("prs_git", 0), metrics.get("prs_meta", 0))
+            counted = [metrics[k] for k in ("prs_git", "prs_meta") if metrics.get(k) is not None]
+            if not counted:      # plain-git / unreadable layout never counted PRs: 0 would be a false shortfall
+                flags.append("ORG_UNCOMPARED:prs")
+                continue
+            found = max(counted)
             lower_than = found
         else:
             found = metrics.get(m)
             if found is None:
+                flags.append("LOC_UNMEASURED" if m == "loc" else f"ORG_UNCOMPARED:{m}")
                 continue
             lower_than = found
         slack = math.ceil(round(found * tolerance_pct / 100, 9)) if m == "loc" else 0
@@ -713,13 +729,15 @@ def build_rows(rec, st):
             e = hits[0]
             st["matched"] |= {id(h) for h in hits}
             if len(hits) > 1:
+                # several candidate rows: which one is this repo is a guess, so nothing is compared
                 flags.append("AMBIGUOUS_ORG_ROW")
-            if e["rows"] > 1:
-                flags.append("MULTI_ROW")
-            flags += [f"ORG_VALUE_UNPARSEABLE:{m}" for m in sorted(e["bad"])]
-            errs, fl, vals = compare_metrics(org, e["vals"], rec["metrics"], st["tol"])
-            rec["findings"] += errs
-            flags += fl
+            else:
+                if e["rows"] > 1:
+                    flags.append("MULTI_ROW")
+                flags += [f"ORG_VALUE_UNPARSEABLE:{m}" for m in sorted(e["bad"])]
+                errs, fl, vals = compare_metrics(org, e["vals"], rec["metrics"], st["tol"])
+                rec["findings"] += errs
+                flags += fl
     fails = [x for x in rec["findings"] if x["level"] == "FAIL"]
     warns = [x for x in rec["findings"] if x["level"] == "WARN"]
     m = rec["metrics"]
@@ -818,6 +836,9 @@ def _run(input_dir, output_dir, work_dir, live=None, want_loc=True, tolerance_pc
                 used.add(id(fc))
             try:
                 recs = analyse_archive(arch, rel, ctx, fc)
+            except ce.Interrupted:      # a child process was killed mid-archive: it is NOT_CHECKED, not half-reported
+                _STOP["sig"] = _STOP["sig"] or signal.SIGTERM
+                break
             except Exception as e:
                 kind = env_kind(e)
                 if not kind:
@@ -843,7 +864,8 @@ def _run(input_dir, output_dir, work_dir, live=None, want_loc=True, tolerance_pc
             if res["env"]:
                 notes.add("ENVIRONMENT PROBLEM, run stopped: " + res["env"][1])
             else:
-                notes.add(f"INTERRUPTED by {signal.Signals(_STOP['sig']).name}: stopped after the current archive")
+                notes.add(f"INTERRUPTED by {signal.Signals(_STOP['sig']).name}: the archive in progress was abandoned "
+                          "(running git/scc calls are killed), no later archive was started")
             for rel in left:
                 notes.add(f"NOT_CHECKED: {rel}")
             res["interrupted"] = _STOP["sig"]
@@ -889,6 +911,7 @@ def run(input_dir, output_dir, work_dir, live=None, want_loc=True, tolerance_pct
 
 def _on_signal(signum, frame):
     _STOP["sig"] = signum
+    ce.request_stop()       # wakes the running git/tar/scc call so a 30-minute fsck cannot outlast `docker stop`
 
 
 def _summary(res, out):
@@ -911,6 +934,7 @@ def main(argv=None):
             for s in (signal.SIGINT, signal.SIGTERM):
                 handlers[s] = signal.signal(s, _on_signal)
         _STOP["sig"] = None
+        ce.clear_stop()
         return _main()
     except UsageError as e:
         print(str(e), file=sys.stderr)
@@ -922,6 +946,7 @@ def main(argv=None):
         for s, h in handlers.items():
             signal.signal(s, h)
         _STOP["sig"] = None
+        ce.clear_stop()
         cleanup_scratch()
         os.umask(old_umask)
 
@@ -934,7 +959,13 @@ def _main():
         raise UsageError(f"input folder not found: {inp}")
     if not any(inp.iterdir()):
         raise UsageError(f"input folder is empty: {inp}")
-    tol = float(os.environ.get("LOC_TOLERANCE_PCT", "0"))
+    raw_tol = os.environ.get("LOC_TOLERANCE_PCT", "0").strip()
+    try:
+        tol = float(raw_tol)
+        if not math.isfinite(tol) or tol < 0:
+            raise ValueError
+    except ValueError:
+        raise UsageError(f"LOC_TOLERANCE_PCT must be a non-negative number, got {raw_tol!r}")
     if not shutil.which("scc"):
         raise UsageError("scc is not installed, so lines of code cannot be measured and the org-CSV LOC floor would be "
                          "silently skipped. Refusing to run: install scc (the Docker image includes it).")
