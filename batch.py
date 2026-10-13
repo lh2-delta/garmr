@@ -456,15 +456,20 @@ def compare_prs(o, metrics, errors, flags, extras):
                                  expected=o, found=low, missing=None) | {"item": "prs", "missing_count": o - low})
 
 
-def compare_metrics(org, row, metrics, tolerance_pct, extras=None):
+def compare_metrics(org, row, metrics, tolerance_pct, extras=None, superseded=()):
     """-> (errors: [finding], flags: [str], org_values: dict). `extras`, when a list is given, receives
-    (metric, amount, reference) for every metric the archive holds more of than the reference."""
+    (metric, amount, reference) for every metric the archive holds more of than the reference. `superseded` names the
+    metrics a for-check bounds: the source's own counts outrank the org reference (profiler or client summary), so they
+    are not compared here and are flagged ORG_SUPERSEDED:<metric> instead."""
     errors, flags, vals = [], [], {}
     extras = [] if extras is None else extras
     for m, col in org["metrics"].items():
         o = parse_org_value(row.get(col))[0]
         vals[m] = o
         if o is None:
+            continue
+        if m in superseded:
+            flags.append(f"ORG_SUPERSEDED:{m}")
             continue
         if m == "prs":
             compare_prs(o, metrics, errors, flags, extras)
@@ -782,7 +787,8 @@ def build_rows(rec, st):
                 if e["rows"] > 1:
                     flags.append("MULTI_ROW")
                 flags += [f"ORG_VALUE_UNPARSEABLE:{m}" for m in sorted(e["bad"])]
-                errs, fl, vals = compare_metrics(org, e["vals"], rec["metrics"], st["tol"], extras)
+                errs, fl, vals = compare_metrics(org, e["vals"], rec["metrics"], st["tol"], extras,
+                                                 rec["metrics"].get("for_check_supersedes") or ())
                 rec["findings"] += errs + extra_findings(extras)
                 flags += fl
     fails = [x for x in rec["findings"] if x["level"] == "FAIL"]
@@ -796,7 +802,7 @@ def build_rows(rec, st):
         "commits_head": m.get("commits_head", ""), "commits_all": m.get("commits_all", ""),
         "prs_git": m.get("prs_git", ""), "prs_meta": m.get("prs_meta", ""),
         "prs_merged": m.get("prs_merged", ""), "prs_unmerged": m.get("prs_unmerged", ""),
-        "visibility": m.get("visibility") or "unknown", "extra_metrics": extra_column(extras),
+        "visibility": m.get("visibility") or "unknown", "extra_metrics": extra_column(extras + list(m.get("for_check_extras") or [])),
         "history_tags": ";".join(ce.history_tags(rec["findings"], m)), "labels": m.get("labels", ""),
         "issues": m.get("issues", ""), "branches": m.get("branches", ""), "tags": m.get("tags", ""),
         "files": m.get("files", ""), "loc": "" if m.get("loc") is None else m["loc"],

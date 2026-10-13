@@ -163,6 +163,14 @@ reference's 5"), the amount goes into the `extra_metrics` column (`prs_git:+3;pr
 none) and the old `ORG_LOWER:<metric>` flag is still set. Unmerged or imported PRs usually explain extra PR numbers. Commits are
 extra only when the default branch alone holds more (other branches may legitimately hold more); loc applies the tolerance first.
 
+**The for-check outranks this CSV.** A `.for-check.csv` holds the source platform's own counts taken before and after the
+export, so for every metric it bounds (`prs`, `commits`, `branches`, `tags`) it is the reference and the org CSV (the
+profiler re-run or the client's summary) is not compared for that metric: the report flags `ORG_SUPERSEDED:<metric>` and the
+`source` count check (`live_counts`: below the lower bound fails, above the upper bound warns) decides. Whatever the archive
+holds above the for-check's upper bound is an extra and goes into `extra_metrics` too (`prs_metadata:+2`). Metrics the
+for-check does not cover (`loc`, `files`) and archives without a for-check keep using the org CSV. Precedence, strongest first:
+for-check, live API, org CSV.
+
 **`history_tags`** (column, `;`-separated, stable order) names what is odd about the history itself. They are labels for a
 person, built from signals Garmr already computes; suspected, never proof, and they change no verdict.
 

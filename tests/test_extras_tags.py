@@ -85,6 +85,51 @@ def test_end_to_end_no_extras_leaves_the_column_empty(tmp_path):
     assert rep[0]["extra_metrics"] == "" and "extra_metrics" not in rep[0]["warned_checks"]
 
 
+# ---------------------------------------------------------------- the for-check outranks the reference
+
+def test_a_superseded_metric_is_not_compared_and_is_flagged():
+    extras = []
+    errs, flags, _ = batch.compare_metrics(_org([], "prs"), {"prs": "10"}, {"prs_git": 0, "prs_merged": 0}, 0, extras, {"prs"})
+    assert errs == [] and extras == [] and flags == ["ORG_SUPERSEDED:prs"]
+    org = _org([], "commits")      # only the metrics the for-check bounds are skipped: commits is still judged
+    errs, flags, _ = batch.compare_metrics(org, {"commits": "50"}, {"commits_all": 5, "commits_head": 5}, 0, [], {"prs"})
+    assert errs and errs[0]["item"] == "commits" and not any(f.startswith("ORG_SUPERSEDED") for f in flags)
+
+
+def _run_with_for_check(tmp_path, reference_prs, after=None):
+    import csv
+    from conftest import COUNTS_OK, build_github_tree, make_for_check, tar_it
+    inp, out, work = tmp_path / "in", tmp_path / "out", tmp_path / "work"
+    inp.mkdir()
+    tree = build_github_tree(tmp_path / "tree")
+    archive = inp / "acme-widgets-42.tar.gz"
+    tar_it(tree, archive)
+    if after is not False:
+        make_for_check(archive, tree, after=dict(COUNTS_OK, **(after or {})), before=dict(COUNTS_OK, **(after or {})))
+    with open(inp / "reference.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["repo", "merged_prs"])
+        w.writerow(["acme-widgets-42", reference_prs])
+    batch.run(inp, out, work, want_loc=False)
+    return next(csv.DictReader(open(out / "completeness_report.csv", newline="")))
+
+
+def test_with_a_for_check_a_reference_that_would_fail_is_overridden(tmp_path):
+    r = _run_with_for_check(tmp_path, reference_prs=10)            # the archive holds 3 PRs, the for-check says 3
+    assert r["status"] == "COMPLETE" and "ORG_SUPERSEDED:prs" in r["flags"].split(";") and r["extra_metrics"] == ""
+
+
+def test_without_a_for_check_the_same_reference_fails(tmp_path):
+    r = _run_with_for_check(tmp_path, reference_prs=10, after=False)
+    assert r["status"] == "INCOMPLETE" and "org_report_mismatch" in r["failed_checks"]
+    assert "ORG_SUPERSEDED" not in r["flags"]
+
+
+def test_archive_above_the_for_check_upper_bound_is_an_extra_in_the_column(tmp_path):
+    r = _run_with_for_check(tmp_path, reference_prs=1, after={"prs": 1})   # for-check counts 1 PR, the archive holds 3
+    assert r["extra_metrics"] == "prs_metadata:+2" and r["status"] == "COMPLETE"
+
+
 # ---------------------------------------------------------------- history tags
 
 def F(level, check, item=None):

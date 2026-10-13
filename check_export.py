@@ -1359,6 +1359,26 @@ def for_check_findings(fc, label, single, mine, facts, ref_pattern, entities, re
     return out + compare_counts(label, mine, bounds, "source"), bounds
 
 
+# for-check entity -> (the org-reference metric it supersedes, the name used in the extra_metrics column)
+FOR_CHECK_SUPERSEDES = {"prs": ("prs", "prs_metadata"), "commits": ("commits", "commits"),
+                        "branches": ("branches", "branches"), "tags": ("tags", "tags")}
+
+
+def apply_for_check_reference(m, mine, bounds):
+    """The for-check holds the SOURCE's own counts, so for the metrics it bounds it outranks any org reference (the profiler
+    re-run or the client's summary): batch.compare_metrics skips them and flags ORG_SUPERSEDED. What the archive holds above
+    the for-check's upper bound is an extra, reported in the extra_metrics column."""
+    sup, extras = [], []
+    for ent, (metric, name) in FOR_CHECK_SUPERSEDES.items():
+        if ent not in bounds:
+            continue
+        sup.append(metric)
+        a, hi = mine.get(ent), bounds[ent][1]
+        if a is not None and a > hi:
+            extras.append((name, a - hi, hi))
+    m["for_check_supersedes"], m["for_check_extras"] = sup, extras
+
+
 def for_check_orphans(fc, labels):
     """for-check repo sections that match no repo of the unit."""
     if not fc or fc.error or not labels:
@@ -1839,6 +1859,7 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
         fc_f, fc_bounds = for_check_findings(fc, label, single, mine, facts, GITHUB_REF, COUNT_ENTITIES,
                                              r.get("default_branch"))
         f += fc_f
+        apply_for_check_reference(m, mine, fc_bounds)
         others = [("live API", side.get("visibility"))]
         if fc and fkey:
             others.append(("for-check", fc.source_visibility(fkey)))
@@ -2011,7 +2032,9 @@ def check_gitlab(root: Path, work: Path, scan_lfs, want_loc, fallback_name, fc=N
     mine = {"issues": len(nd.get("issues", [])), "prs": len(nd.get("merge_requests", [])), "labels": len(titles),
             "milestones": len(nd.get("milestones", [])), "releases": len(nd.get("releases", [])),
             "branches": m.get("branches"), "tags": m.get("tags"), "commits": m.get("commits_head")}
-    f += for_check_findings(fc, label, True, mine, facts or {}, GITLAB_REF, GITLAB_ENTITIES, pj.get("default_branch"))[0]
+    gl_f, gl_bounds = for_check_findings(fc, label, True, mine, facts or {}, GITLAB_REF, GITLAB_ENTITIES, pj.get("default_branch"))
+    f += gl_f
+    apply_for_check_reference(m, mine, gl_bounds)
     fkey = fc.match_repo(label, True) if fc and not fc.error else None
     if fkey:
         f += visibility_findings(label, vis, [("for-check", fc.source_visibility(fkey))])
