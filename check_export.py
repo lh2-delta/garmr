@@ -731,6 +731,37 @@ def imported_history(created_at, first_ts):
     return first_ts < c - SKEW_S
 
 
+# What each history_forgery signal (its `item`) says about the history, as a tag a person can filter on
+HISTORY_TAG_OF_SIGNAL = {
+    "created_after_history": "imported",
+    "future_dated": "suspected_forged", "author_after_committer": "suspected_forged", "non_monotonic": "suspected_forged",
+    "bulk_timestamp": "suspected_forged", "single_committer": "suspected_forged", "bad_signature": "suspected_forged",
+    "multi_root": "flattened", "squashed": "flattened",
+    "unreachable": "rewritten", "reflog_rewrite": "rewritten",
+}
+HISTORY_TAGS = ("imported", "forked", "suspected_forged", "flattened", "rewritten", "faulty")
+
+
+def history_tags(findings, metrics):
+    """Tags for what is odd about the history itself, built from signals already computed. They are labels for a person to
+    read (suspected, never proof) and change no verdict: the findings that warn or fail are exactly the same without them."""
+    tags = set()
+    for x in findings:
+        if x.get("check") == "history_forgery":
+            tag = HISTORY_TAG_OF_SIGNAL.get(x.get("item"))
+            if tag:
+                tags.add(tag)
+        elif x.get("level") == "FAIL" and x.get("check") in ("git_integrity", "repo_git", "archive_integrity"):
+            tags.add("faulty")
+    if metrics.get("fork"):
+        tags.add("forked")
+    if metrics.get("imported_prs"):          # merge commits whose PR numbers belong to the repo's earlier life
+        tags.add("imported")
+    if metrics.get("base_force_pushes"):     # the platform recorded base branches being force-pushed after PRs merged
+        tags.add("rewritten")
+    return [t for t in HISTORY_TAGS if t in tags]
+
+
 def created_ts(created_at):
     try:
         return datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).timestamp()
@@ -1649,6 +1680,9 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
     f += gf
     f += created_vs_first_commit(label, r.get("created_at"), facts.get("first_commit_ts"))
     m = rec["metrics"] = dict(facts["metrics"], visibility=vis)
+    if r.get("fork"):
+        m["fork"] = True
+    m["base_force_pushes"] = sum(1 for e in of_repo("issue_events") if e.get("event") == "base_ref_force_pushed")
     prs = of_repo("pull_requests")
     meta_prs = {n for n in (num_of(p.get("url")) or int_or_none(p.get("number")) for p in prs) if n is not None}
     set_pr_categories(m, pr_categories(prs, lambda p: num_of(p.get("url")) or int_or_none(p.get("number"))))
@@ -1707,6 +1741,7 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
                 and foreign_merge(facts["merge_info"][n], by_num[n], r.get("created_at"))]
     unmerged = [n for n in unmerged if n not in imported]
     if imported:
+        m["imported_prs"] = True
         f.append(finding("WARN", "pr_state", f"{label}: merge commit(s) for PR(s) {imported[:10]} predate this repo or "
                          f"name another head branch than the PR record of that number; the numbers likely belong to "
                          f"the repo's earlier life, so the unmerged metadata is not judged"))

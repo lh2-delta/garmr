@@ -79,7 +79,7 @@ All files are created mode `0600` (owner only), since they list repo names and w
 
 | File | Contents |
 |---|---|
-| `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `for_check` (`yes` / `no` / `unreadable` / `empty`), counts found in the archive, the org's numbers, `flags`. `visibility`: `public` / `private` / `internal` / `unknown`, read from the repository record (GitHub `private`, GitLab `visibility` / `visibility_level` 20 / 10 / 0, Bitbucket `is_private`); `unknown` when the record lacks it, is unreadable or the layout is plain git, never guessed. `prs_merged` / `prs_unmerged`: counts of distinct PR (GitHub) / MR (GitLab) records in the metadata. merged = non-empty `merged_at` (or state `merged`); unmerged = every other record, closed without a merge and still open alike (one combined count, no separate "open"). `state` is only the fallback (GitHub export records carry none). A number with several records counts once, as merged if any of them is. The two are blank (not 0) when the export carries no PR/MR records, the layout has none (plain git), or a record has none of `merged_at` / `closed_at` / `state`. `prs_git` and `prs_meta` are unchanged |
+| `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `for_check` (`yes` / `no` / `unreadable` / `empty`), counts found in the archive, the org's numbers, `flags`. `visibility`: `public` / `private` / `internal` / `unknown`, read from the repository record (GitHub `private`, GitLab `visibility` / `visibility_level` 20 / 10 / 0, Bitbucket `is_private`); `unknown` when the record lacks it, is unreadable or the layout is plain git, never guessed. `prs_merged` / `prs_unmerged`: counts of distinct PR (GitHub) / MR (GitLab) records in the metadata. merged = non-empty `merged_at` (or state `merged`); unmerged = every other record, closed without a merge and still open alike (one combined count, no separate "open"). `state` is only the fallback (GitHub export records carry none). A number with several records counts once, as merged if any of them is. The two are blank (not 0) when the export carries no PR/MR records, the layout has none (plain git), or a record has none of `merged_at` / `closed_at` / `state`. `prs_git` and `prs_meta` are unchanged. `extra_metrics` (what the archive holds more of than the reference, e.g. `prs_git:+3;commits:+12`) and `history_tags` (`imported`, `forked`, `suspected_forged`, `flattened`, `rewritten`, `faulty`) are described under "Org metrics CSV" below |
 | `missing_items.csv` | only errors: one row per failed check with `expected`, `found`, `missing_count`, `missing_items` (e.g. PR numbers in git but with no metadata record). `missing_items` lists at most 200 examples; `missing_count` is always the real total |
 | `run_notes.txt` | non-fatal notices: CSVs skipped or unused, `.xlsx` files not read, archives that were not checked |
 
@@ -99,7 +99,7 @@ the `flags` column are notices, not failures:
 | `KIND_ABSENT:<kind>` | the archive has no file of this kind (e.g. no `labels_*.json`) |
 | `MULTI_ROW` | several org-CSV rows (one per branch) for the repo were collapsed by max |
 | `ORG_VALUE_UNPARSEABLE:<metric>` | the org-CSV cell is not a number; not compared |
-| `ORG_LOWER:<metric>` | the archive holds more than the org CSV says (allowed, see lower bound) |
+| `ORG_LOWER:<metric>` | the archive holds more than the org CSV says (allowed; also an `extra_metrics` WARN and a column entry) |
 | `LOC_BRANCH_DIFF` | `loc` differs, possibly because CSV and archive use different branches |
 | `NOT_IN_ORG_CSV` | archive's repo has no org-CSV row |
 | `AMBIGUOUS_ORG_ROW` | more than one org-CSV row could match; not guessed, so no org number is compared for this repo |
@@ -150,8 +150,30 @@ Provider is auto-detected per archive: `github-migration` (`schema.json`/`reposi
 
 The CSV in `./input` is the summary output of codebase-profiler / repo-metrics-v2. It is a floor: the archive must hold at
 least what it lists. `org_report_mismatch` fails when the CSV number is **greater** than the archive's (commits compared
-with commits across all refs; loc is `scc` code lines at the default branch; also prs, branches, tags, files). A CSV number
-below the archive's is only flagged (`ORG_LOWER:<metric>`).
+with commits across all refs; loc is `scc` code lines at the default branch; also prs, branches, tags, files).
+
+**PRs** are looked for twice: the CSV's merged-PR count must be reached by the PR numbers git history names (`prs_git`) and,
+separately, by the merged PR records in the metadata (`prs_merged`; all PR records, `prs_meta`, when the export carries no
+merged_at/closed_at/state). A side that falls short makes one `org_report_mismatch` finding (item `prs`) naming the side(s); a
+side that cannot be counted is flagged `ORG_UNCOMPARED:prs_git` / `ORG_UNCOMPARED:prs_metadata`, never judged.
+
+**Extras.** A CSV number below what the archive holds is not a failure: it is an **"Extra <metric> detected"** WARN (check
+`extra_metrics`, so it appears in `warned_checks`; for PRs: "Extra PRs detected: 3 more PRs in git history than the
+reference's 5"), the amount goes into the `extra_metrics` column (`prs_git:+3;prs_metadata:+1;commits:+12`, empty when there is
+none) and the old `ORG_LOWER:<metric>` flag is still set. Unmerged or imported PRs usually explain extra PR numbers. Commits are
+extra only when the default branch alone holds more (other branches may legitimately hold more); loc applies the tolerance first.
+
+**`history_tags`** (column, `;`-separated, stable order) names what is odd about the history itself. They are labels for a
+person, built from signals Garmr already computes; suspected, never proof, and they change no verdict.
+
+| Tag | Set when |
+|---|---|
+| `imported` | the first commit is older than the repository's `created_at` (`created_after_history`), or merge commits carry PR numbers that belong to the repo's earlier life (the `pr_state` imported-numbers WARN) |
+| `forked` | the repository record says it is a fork |
+| `suspected_forged` | a `history_forgery` signal: future-dated commits, author date after committer date, a child older than its parent, bulk same-second commits, one committer over many authors, a BAD signature |
+| `flattened` | one squashed commit, or several root commits |
+| `rewritten` | reflog rewrites or unreachable commits, or the platform recorded `base_ref_force_pushed` events |
+| `faulty` | a failed `git_integrity`, `repo_git` or `archive_integrity` check (missing or corrupt objects, shallow, no refs, truncated archive) |
 
 ### Source-side ground truth: `<archive>.for-check.csv`
 
