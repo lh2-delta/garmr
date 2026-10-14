@@ -58,7 +58,7 @@ BRANCH_DIFF_PCT = 25
 
 REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "for_check",
                "commits_head",
-               "commits_all", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "visibility", "extra_metrics", "history_tags", "labels", "issues",
+               "commits_all", "measured_branch", "commits_measured", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "visibility", "extra_metrics", "history_tags", "labels", "issues",
                "branches", "tags", "files", "loc",
                "org_csv_row", "org_commits", "org_loc", "org_prs", "org_branches", "org_tags", "org_files", "flags"]
 MISSING_COLS = ["repo", "provider", "archive", "check", "item", "expected", "found", "missing_count",
@@ -800,6 +800,7 @@ def build_rows(rec, st):
         "warned_checks": ";".join(sorted({x["check"] for x in warns})),
         "failed_checks": ";".join(sorted({x["check"] for x in fails})), "for_check": rec["for_check"],
         "commits_head": m.get("commits_head", ""), "commits_all": m.get("commits_all", ""),
+        "measured_branch": m.get("measured_branch", ""), "commits_measured": m.get("commits_measured", ""),
         "prs_git": m.get("prs_git", ""), "prs_meta": m.get("prs_meta", ""),
         "prs_merged": m.get("prs_merged", ""), "prs_unmerged": m.get("prs_unmerged", ""),
         "visibility": m.get("visibility") or "unknown", "extra_metrics": extra_column(extras + list(m.get("for_check_extras") or [])),

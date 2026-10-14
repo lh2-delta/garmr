@@ -720,6 +720,25 @@ def history_scan(bare: Path, label: str):
     return out, first_ts
 
 
+def latest_branch(bare: Path, default_branch=None):
+    """The branch (refs/heads/*) whose tip commit is newest, the same rule the profiler uses: a tie goes to the default branch,
+    then to the first name in order. '' when there is no branch, or when GARMR_USE_DEFAULT_BRANCH=1 asks for the old behaviour:
+    the caller then keeps the default branch. The default branch alone can be a stale stub while the real history sits elsewhere."""
+    if os.environ.get("GARMR_USE_DEFAULT_BRANCH", "").strip().lower() in ("1", "true", "yes", "on"):
+        return ""
+    prefix = "refs/heads/"
+    tips = []
+    for ln in git_lines(bare, "for-each-ref", "--format=%(refname)%09%(committerdate:unix)", prefix):
+        ref, _, ts = ln.partition("\t")
+        if ref.startswith(prefix) and ts.strip().isdigit():
+            tips.append((int(ts), ref[len(prefix):]))
+    if not tips:
+        return ""
+    newest = max(ts for ts, _ in tips)
+    tied = sorted(name for ts, name in tips if ts == newest)
+    return default_branch if default_branch in tied else tied[0]
+
+
 def imported_history(created_at, first_ts):
     """True when the first commit is older than the repository record itself (import, mirror, recreation)."""
     if not created_at or first_ts is None:
@@ -914,9 +933,16 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
     if refs:
         metrics["commits_all"] = git_int(bare, "rev-list", "--count", "--all")
     lfs_oids = set()
-    ref = f"refs/heads/{default_branch}" if default_branch and f"refs/heads/{default_branch}" in refs_map else "HEAD"
+    default_ref = f"refs/heads/{default_branch}" if default_branch and f"refs/heads/{default_branch}" in refs_map else "HEAD"
+    if refs and git(bare, "rev-parse", "--verify", "-q", default_ref).returncode == 0:
+        # the for-check's commit count is the platform's default-branch history, so this stays on the default branch
+        metrics["commits_head"] = git_int(bare, "rev-list", "--count", default_ref)
+    # everything else is measured on the branch with the newest commit (the rule the profiler uses), falling back to the default
+    measured = latest_branch(bare, default_branch) if refs else ""
+    ref = f"refs/heads/{measured}" if measured else default_ref
+    metrics["measured_branch"] = measured or (default_branch or "")
     if refs and git(bare, "rev-parse", "--verify", "-q", ref).returncode == 0:
-        metrics["commits_head"] = git_int(bare, "rev-list", "--count", ref)
+        metrics["commits_measured"] = git_int(bare, "rev-list", "--count", ref)
         metrics["files"] = sum(1 for _ in git_lines(bare, "ls-tree", "-r", "--name-only", ref))
         if want_loc:
             try:

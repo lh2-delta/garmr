@@ -150,7 +150,13 @@ Provider is auto-detected per archive: `github-migration` (`schema.json`/`reposi
 
 The CSV in `./input` is the summary output of codebase-profiler / repo-metrics-v2. It is a floor: the archive must hold at
 least what it lists. `org_report_mismatch` fails when the CSV number is **greater** than the archive's (commits compared
-with commits across all refs; loc is `scc` code lines at the default branch; also prs, branches, tags, files).
+with commits across all refs; loc is `scc` code lines on the measured branch; also prs, branches, tags, files).
+
+**Measured branch.** Garmr measures on the branch (`refs/heads/*`) whose tip commit is newest, the rule the profiler uses; a tie
+goes to the default branch, then to the first name. LOC, `files` and the LFS scan use that branch, and the report says which
+in `measured_branch` and counts its history in `commits_measured`. `commits_head` stays on the **default** branch, because the
+for-check's commit count is the platform's default-branch history and must be compared like with like. With no branch at all,
+or with `GARMR_USE_DEFAULT_BRANCH=1`, everything stays on the default branch as before.
 
 **PRs** are looked for twice: the CSV's merged-PR count must be reached by the PR numbers git history names (`prs_git`) and,
 separately, by the merged PR records in the metadata (`prs_merged`; all PR records, `prs_meta`, when the export carries no
@@ -291,7 +297,7 @@ python3 -m pytest -q
 - Commit-message markers (`Merge pull request #N`, `(#N)`, `closes #N`, GitLab `See merge request path!N`) prove a PR existed in
   *this* repo only when the history is its own: for a fork or a repo whose history is older than its `created_at` they are only
   a WARN (`pull_requests` / `number_refs`). A GitLab MR line naming another project is ignored.
-- LOC is counted on a checkout of the default branch from the object store, with `.gitignore`, `.ignore`, `.sccignore` and
+- LOC is counted on a checkout of the **measured branch** (see below) from the object store, with `.gitignore`, `.ignore`, `.sccignore` and
   `export-ignore` all disregarded, so tracked-but-ignored files count.
 - **Nothing has been validated on large (multi-GB) archives**: timings, disk needs and timeouts are untested at that scale.
 - **The first real runs may produce false positives.** Send the `missing_items.csv` rows and the checks can be tuned.
