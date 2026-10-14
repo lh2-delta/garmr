@@ -196,14 +196,14 @@ def test_plain_hash_mention_is_ignored(tmp_path):
 
 def test_merge_commit_in_git_but_pr_not_marked_merged_fails(tmp_path):
     root = build_github_tree(tmp_path / "x")
-    _commit(root, "Merge pull request #2 from a/b")
+    _commit(root, "Merge pull request #2 from a/b2")
     f = one(ce.check_path(root), "pr_state")
     assert f["missing"] == ["#2"]
 
 
 def test_merge_commit_in_git_and_pr_merged_ok(tmp_path):
     root = build_github_tree(tmp_path / "x")
-    _commit(root, "Merge pull request #2 from a/b")
+    _commit(root, "Merge pull request #2 from a/b2")
     edit_json(root / "pull_requests_000001.json",
               lambda d: [x.update(merged_at="2025-01-01T00:00:00Z") for x in d if x["url"].endswith("/pull/2")])
     assert ce.check_path(root)["verdict"] == "COMPLETE"

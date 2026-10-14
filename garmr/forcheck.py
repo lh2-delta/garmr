@@ -107,6 +107,14 @@ class ForCheck:
                 return v
         return None
 
+    def source_visibility(self, key: str):
+        """public / private / internal as the source stated it in a `visibility` count row, else None."""
+        for tag in ("after", "before"):
+            v = (self.counts[tag].get(key, {}).get("visibility") or "").strip().lower()
+            if v in ("public", "private", "internal"):
+                return v
+        return None
+
     def ref_snapshots(self, key: str):
         return self.refs["before"].get(key, {}), self.refs["after"].get(key, {})
 

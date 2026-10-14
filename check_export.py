@@ -62,6 +62,9 @@ def finding(level, check, detail, expected=None, found=None, missing=None, item=
         out["found"] = found
     if missing is not None:
         out["missing"] = list(missing)
+        total = getattr(missing, "total", None)
+        if total is not None and total > len(out["missing"]):
+            out["missing_count"] = total   # the list shows examples only; the count stays real
     return out
 
 
@@ -717,6 +720,63 @@ def history_scan(bare: Path, label: str):
     return out, first_ts
 
 
+def latest_branch(bare: Path, default_branch=None):
+    """The branch (refs/heads/*) whose tip commit is newest, the same rule the profiler uses: a tie goes to the default branch,
+    then to the first name in order. '' when there is no branch, or when GARMR_USE_DEFAULT_BRANCH=1 asks for the old behaviour:
+    the caller then keeps the default branch. The default branch alone can be a stale stub while the real history sits elsewhere."""
+    if os.environ.get("GARMR_USE_DEFAULT_BRANCH", "").strip().lower() in ("1", "true", "yes", "on"):
+        return ""
+    prefix = "refs/heads/"
+    tips = []
+    for ln in git_lines(bare, "for-each-ref", "--format=%(refname)%09%(committerdate:unix)", prefix):
+        ref, _, ts = ln.partition("\t")
+        if ref.startswith(prefix) and ts.strip().isdigit():
+            tips.append((int(ts), ref[len(prefix):]))
+    if not tips:
+        return ""
+    newest = max(ts for ts, _ in tips)
+    tied = sorted(name for ts, name in tips if ts == newest)
+    return default_branch if default_branch in tied else tied[0]
+
+
+_BRANCH_MAPS: dict = {}
+
+
+def branch_override(label):
+    """The branch a caller asked Garmr to measure for this repo, or ''. GARMR_BRANCH_MAP is the path of a JSON object
+    {"owner/name": "branch", "name": "branch"} (keys lower-case; the full label is tried before the bare name). The client's
+    summary names the branch its numbers were measured on, and only that branch makes the comparison like with like. An
+    unreadable or malformed map is ignored, so a bad file never fails a check."""
+    path = os.environ.get("GARMR_BRANCH_MAP", "").strip()
+    if not path:
+        return ""
+    try:
+        mtime = os.stat(path).st_mtime
+        cached = _BRANCH_MAPS.get(path)
+        if not cached or cached[0] != mtime:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            clean = {str(k).lower(): v for k, v in data.items() if isinstance(v, str) and v} if isinstance(data, dict) else {}
+            _BRANCH_MAPS[path] = cached = (mtime, clean)
+    except (OSError, ValueError):
+        return ""
+    lab = (label or "").lower()
+    for key in (lab, lab.rpartition("/")[2]):
+        if key and key in cached[1]:
+            return cached[1][key]
+    return ""
+
+
+def choose_branch(bare: Path, default_branch=None, label=None):
+    """(branch, how) to measure. how: 'client' when the branch map names a branch that exists in this archive (it wins over
+    everything, even GARMR_USE_DEFAULT_BRANCH), 'newest' when the newest-commit rule chose one, '' when the default branch stays."""
+    want = branch_override(label)
+    if want and git(bare, "show-ref", "--verify", "--quiet", f"refs/heads/{want}").returncode == 0:
+        return want, "client"
+    name = latest_branch(bare, default_branch)
+    return (name, "newest") if name else ("", "")
+
+
 def imported_history(created_at, first_ts):
     """True when the first commit is older than the repository record itself (import, mirror, recreation)."""
     if not created_at or first_ts is None:
@@ -726,6 +786,58 @@ def imported_history(created_at, first_ts):
     except ValueError:
         return False
     return first_ts < c - SKEW_S
+
+
+# What each history_forgery signal (its `item`) says about the history, as a tag a person can filter on
+HISTORY_TAG_OF_SIGNAL = {
+    "created_after_history": "imported",
+    "future_dated": "suspected_forged", "author_after_committer": "suspected_forged", "non_monotonic": "suspected_forged",
+    "bulk_timestamp": "suspected_forged", "single_committer": "suspected_forged", "bad_signature": "suspected_forged",
+    "multi_root": "flattened", "squashed": "flattened",
+    "unreachable": "rewritten", "reflog_rewrite": "rewritten",
+}
+HISTORY_TAGS = ("imported", "forked", "suspected_forged", "flattened", "rewritten", "faulty")
+
+
+def history_tags(findings, metrics):
+    """Tags for what is odd about the history itself, built from signals already computed. They are labels for a person to
+    read (suspected, never proof) and change no verdict: the findings that warn or fail are exactly the same without them."""
+    tags = set()
+    for x in findings:
+        if x.get("check") == "history_forgery":
+            tag = HISTORY_TAG_OF_SIGNAL.get(x.get("item"))
+            if tag:
+                tags.add(tag)
+        elif x.get("level") == "FAIL" and x.get("check") in ("git_integrity", "repo_git", "archive_integrity"):
+            tags.add("faulty")
+    if metrics.get("fork"):
+        tags.add("forked")
+    if metrics.get("imported_prs"):          # merge commits whose PR numbers belong to the repo's earlier life
+        tags.add("imported")
+    if metrics.get("base_force_pushes"):     # the platform recorded base branches being force-pushed after PRs merged
+        tags.add("rewritten")
+    return [t for t in HISTORY_TAGS if t in tags]
+
+
+def created_ts(created_at):
+    try:
+        return datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def foreign_merge(entries, pr, created_at):
+    """True when every merge commit for PR number N looks like it belongs to another repository: dated before this
+    repo existed, or naming a head branch other than the one PR #N has here (numbers collide after an import)."""
+    c = created_ts(created_at) if created_at else None
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    ref = str_of(head.get("ref")).removeprefix("refs/heads/")
+    for ts, src in entries:
+        old = c is not None and ts is not None and ts < c - SKEW_S
+        other = bool(ref and src and src.partition("/")[2] != ref)
+        if not (old or other):
+            return False
+    return True
 
 
 def created_vs_first_commit(label, created_at, first_ts):
@@ -745,26 +857,40 @@ ONE_REF = re.compile(r"([\w.-]+/[\w.-]+)?#(\d+)")
 BARE_REF = re.compile(r"(?<![\w/.#-])#(\d+)\b")
 
 
-def commit_messages(bare: Path):
+def commit_messages_dated(bare: Path):
+    """(committer ts or None, message) per commit, streamed."""
     buf, size = [], 0
-    for line in git_lines(bare, "log", "--all", "--format=%B%x1e"):
+
+    def emit():
+        head, sep, body = "".join(buf).partition("\x1f")
+        if not sep:
+            head, body = "", "".join(buf)
+        body = body.strip()
+        return (int(head) if head.isdigit() else None, body) if body else None
+
+    for line in git_lines(bare, "log", "--all", "--format=%ct%x1f%B%x1e"):
         if "\x1e" in line:
             head, _, tail = line.partition("\x1e")
             buf.append(head)
-            msg = "".join(buf).strip()
-            if msg:
-                yield msg
+            item = emit()
+            if item:
+                yield item
             buf, size = [tail], len(tail)
         elif size < MAX_MESSAGE_CHARS:
             buf.append(line)
             size += len(line)
-    msg = "".join(buf).strip()
-    if msg:
+    item = emit()
+    if item:
+        yield item
+
+
+def commit_messages(bare: Path):
+    for _ts, msg in commit_messages_dated(bare):
         yield msg
 
 
 def empty_facts():
-    return {"pr_numbers": set(), "pr_source": "none", "metrics": {}, "merge_prs": set(), "squash_prs": set(),
+    return {"pr_numbers": set(), "pr_source": "none", "metrics": {}, "merge_prs": set(), "squash_prs": set(), "merge_info": {},
             "closes": set(), "tags": set(), "branches": set(), "lfs_oids": set(), "refs_map": {}, "bare_mentions": set(),
             "pr_ref_count": 0, "refs_known": False, "first_commit_ts": None}
 
@@ -819,9 +945,12 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
     ref_nums = {int(m.group(1)) for r in refs for m in [re.match(r"refs/(?:pull|merge-requests)/(\d+)/head$", r)] if m}
     facts["pr_ref_count"] = len(ref_nums)
     merge_prs, squash_prs, closes, mentions = set(), set(), set(), set()
+    merge_info: dict[int, list] = {}   # PR number -> [(commit ts, "owner/branch" or None)] to spot another repo's numbers
     if refs:
-        for m in commit_messages(bare):
+        for ts, m in commit_messages_dated(bare):
             merge_prs |= {int(n) for n in re.findall(r"^Merge pull request #(\d+)", m, re.M)}
+            for n, src in re.findall(r"^Merge pull request #(\d+)(?: from (\S+))?", m, re.M):
+                merge_info.setdefault(int(n), []).append((ts, src or None))
             # "See merge request group/proj!N" names its project; another project's MR is not this repo's
             merge_prs |= {int(n) for path, n in re.findall(r"See merge request (\S*?)!(\d+)", m)
                           if not path or path.lower() == slug.lower()}
@@ -842,9 +971,17 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
     if refs:
         metrics["commits_all"] = git_int(bare, "rev-list", "--count", "--all")
     lfs_oids = set()
-    ref = f"refs/heads/{default_branch}" if default_branch and f"refs/heads/{default_branch}" in refs_map else "HEAD"
+    default_ref = f"refs/heads/{default_branch}" if default_branch and f"refs/heads/{default_branch}" in refs_map else "HEAD"
+    if refs and git(bare, "rev-parse", "--verify", "-q", default_ref).returncode == 0:
+        # the for-check's commit count is the platform's default-branch history, so this stays on the default branch
+        metrics["commits_head"] = git_int(bare, "rev-list", "--count", default_ref)
+    # everything else is measured on the branch with the newest commit (the rule the profiler uses), falling back to the default
+    measured, by = choose_branch(bare, default_branch, label) if refs else ("", "")
+    ref = f"refs/heads/{measured}" if measured else default_ref
+    metrics["measured_branch"] = measured or (default_branch or "")
+    metrics["measured_by"] = by or "default"
     if refs and git(bare, "rev-parse", "--verify", "-q", ref).returncode == 0:
-        metrics["commits_head"] = git_int(bare, "rev-list", "--count", ref)
+        metrics["commits_measured"] = git_int(bare, "rev-list", "--count", ref)
         metrics["files"] = sum(1 for _ in git_lines(bare, "ls-tree", "-r", "--name-only", ref))
         if want_loc:
             try:
@@ -865,7 +1002,7 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
                         lfs_oids.add(m.group(1))
                 f.append(finding("WARN", "lfs", f"{label}: {n} LFS pointer file(s) at HEAD; "
                                  + ("lfs/objects present" if have else "LFS objects are NOT in the archive")))
-    facts.update({"pr_numbers": nums, "pr_source": source, "merge_prs": merge_prs, "squash_prs": squash_prs,
+    facts.update({"pr_numbers": nums, "pr_source": source, "merge_prs": merge_prs, "merge_info": merge_info, "squash_prs": squash_prs,
                   "closes": closes, "bare_mentions": mentions, "lfs_oids": lfs_oids,
                   "tags": {r[len("refs/tags/"):] for r in refs if r.startswith("refs/tags/")},
                   "branches": {r[len("refs/heads/"):] for r in refs if r.startswith("refs/heads/")}})
@@ -893,8 +1030,73 @@ def num_of(url):
     return int(m.group(1)) if m else None
 
 
+VISIBILITIES = ("public", "private", "internal")
+GL_VISIBILITY_LEVEL = {0: "private", 10: "internal", 20: "public"}
+
+
+def visibility_of(rec):
+    """public / private / internal / unknown from one repository record (GitHub `private`, GitLab `visibility` /
+    `visibility_level`, Bitbucket `is_private`). Anything absent or unrecognised is `unknown`, never a guess."""
+    if not isinstance(rec, dict):
+        return "unknown"
+    v = rec.get("visibility")
+    if isinstance(v, str) and v.strip().lower() in VISIBILITIES:
+        return v.strip().lower()
+    lvl = rec.get("visibility_level")
+    if isinstance(lvl, str) and lvl.strip().isdigit():
+        lvl = int(lvl)
+    if isinstance(lvl, int) and not isinstance(lvl, bool) and lvl in GL_VISIBILITY_LEVEL:
+        return GL_VISIBILITY_LEVEL[lvl]
+    for k in ("is_private", "private"):
+        if isinstance(rec.get(k), bool):
+            return "private" if rec[k] else "public"
+    return "unknown"
+
+
+def visibility_findings(label, mine, others):
+    """WARN when the archive's visibility is known and a for-check / live API value (others: [(origin, value)]) is
+    known and different. Informational: a missing value on either side is skipped silently."""
+    if mine not in VISIBILITIES:
+        return []
+    return [finding("WARN", "visibility_mismatch", f"{label}: archive record says {mine}, {origin} says {theirs}",
+                    expected=theirs, found=mine, item=origin)
+            for origin, theirs in others if theirs in VISIBILITIES and theirs != mine]
+
+
+def pr_categories(recs, number):
+    """-> {merged, unmerged} counts of distinct numbered PR/MR records, or None when there are none or one carries
+    none of merged_at / closed_at / state (its status would be a guess). `unmerged` is everything not merged, closed
+    without a merge and still open alike: a consumer comparing against merged PRs only needs that split. Duplicates
+    count once, as merged if any of them is."""
+    merged = {}
+    for p in recs:
+        n = number(p)
+        if n is None:
+            continue
+        if not any(k in p for k in ("merged_at", "closed_at", "state")):
+            return None
+        is_merged = bool(str_of(p.get("merged_at")).strip()) or str(p.get("state") or "").strip().lower() == "merged"
+        merged[n] = merged.get(n, False) or is_merged
+    if not merged:
+        return None
+    return {"merged": sum(merged.values()), "unmerged": len(merged) - sum(merged.values())}
+
+
+def set_pr_categories(m, cats):
+    if cats:
+        m["prs_merged"], m["prs_unmerged"] = cats["merged"], cats["unmerged"]
+
+
+class CappedList(list):
+    total = 0
+
+
 def capped(items, n=200):
-    return list(items)[:n]
+    """First n items as examples; .total keeps the real size so finding() can report it."""
+    items = list(items)
+    out = CappedList(items[:n])
+    out.total = len(items)
+    return out
 
 
 # ---------------------------------------------------------------- metadata completeness (any record, git or not)
@@ -970,36 +1172,63 @@ def _common(freqs, n):
     return [k for k, c in freqs.items() if c < n and c * 2 > n and k not in PEER_EXCLUDE]
 
 
-def incomplete_records(recs, core):
-    """Records missing fields the kind requires, or fields most of their peers have. Applies to ALL records."""
-    out = []
+# Records of one kind can carry type-specific fields (a "referenced" event has commit_repository, a "closed" one does not;
+# an attachment hangs off exactly one parent key), so peers are only compared within the same sub-kind.
+ATTACHMENT_PARENTS = ("issue_comment", "pull_request", "pull_request_review_comment", "issue", "release")
+PEER_GROUP = {
+    "issue_event": lambda r: str(r.get("event")),
+    "attachment": lambda r: tuple(k for k in ATTACHMENT_PARENTS if k in r),
+}
+PEER_GROUP["issue_events"], PEER_GROUP["attachments"] = PEER_GROUP["issue_event"], PEER_GROUP["attachment"]
+
+
+def _peer_missing(recs):
+    """({rec index: [missing field, ...]}) among uniform peers; fields most peers have but this one lacks."""
     n = len(recs)
-    common, sub_common = [], {}
-    if n >= 4:
-        freq: dict[str, int] = {}
-        for r in recs:
-            for k in r:
-                freq[k] = freq.get(k, 0) + 1
-        common = _common(freq, n)
-        dict_fields = {k for r in recs for k, v in r.items() if isinstance(v, dict)}
-        for k in dict_fields:
-            holders = [r[k] for r in recs if isinstance(r.get(k), dict)]
-            sf: dict[str, int] = {}
-            for d in holders:
-                for s in d:
-                    sf[s] = sf.get(s, 0) + 1
-            if len(holders) >= 4:
-                sub_common[k] = _common(sf, len(holders))
+    if n < 4:
+        return {}
+    freq: dict[str, int] = {}
+    for r in recs:
+        for k in r:
+            freq[k] = freq.get(k, 0) + 1
+    common = _common(freq, n)
+    sub_common = {}
+    for k in {k for r in recs for k, v in r.items() if isinstance(v, dict)}:
+        holders = [r[k] for r in recs if isinstance(r.get(k), dict)]
+        sf: dict[str, int] = {}
+        for d in holders:
+            for sub in d:
+                sf[sub] = sf.get(sub, 0) + 1
+        if len(holders) >= 4:
+            sub_common[k] = _common(sf, len(holders))
+    miss = {}
+    for i, r in enumerate(recs):
+        m = [k for k in common if k not in r]
+        for k, subs in sub_common.items():
+            if isinstance(r.get(k), dict):
+                m += [f"{k}.{s}" for s in subs if s not in r[k]]
+        if m:
+            miss[i] = m
+    return miss
+
+
+def incomplete_records(recs, core, group=None):
+    """Records missing fields the kind requires, or fields most of their same-kind peers have. Applies to ALL records."""
+    peer: dict[int, list] = {}
+    buckets: dict = {}
+    for i, r in enumerate(recs):
+        buckets.setdefault(group(r) if group else None, []).append(i)
+    for idxs in buckets.values():
+        for j, m in _peer_missing([recs[i] for i in idxs]).items():
+            peer[idxs[j]] = m
+    out = []
     for i, r in enumerate(recs):
         rid = record_id(r, i)
         for fld in core:
             ok, v = lookup(r, fld)
             if not ok or (v in (None, "") and fld.split(".")[-1] not in NULL_OK and fld not in NULL_OK):
                 out.append(f"{rid}:{fld}")
-        out += [f"{rid}:{k}" for k in common if k not in r and k not in core]
-        for k, subs in sub_common.items():
-            if isinstance(r.get(k), dict):
-                out += [f"{rid}:{k}.{s}" for s in subs if s not in r[k] and f"{k}.{s}" not in core]
+        out += [f"{rid}:{k}" for k in peer.get(i, []) if k not in core]
     return out
 
 
@@ -1015,8 +1244,10 @@ def page_findings(pages):
                 if len(gaps) >= 200:
                     break
         if gaps:
+            gaps = capped(gaps)
+            gaps.total = nums[-1] - len(have)   # the loop above stops listing at 200, the shortfall is exact
             out.append(finding("FAIL", "page_sequence", f"{kind}: page file(s) missing from the sequence: {gaps[:5]}",
-                               expected=nums[-1], found=len(nums), missing=capped(gaps), item=kind))
+                               expected=nums[-1], found=len(nums), missing=gaps, item=kind))
         final = max(pg, key=lambda x: x[0])
         others = [c for n, c, _f in pg if n != final[0]]
         if others:
@@ -1143,7 +1374,7 @@ def compare_counts(label, mine, bounds, origin):
     return out
 
 
-def live_bounds(live, owner, name, label):
+def live_bounds(live, owner, name, label, side=None):
     """-> ({entity: (v, v)}, [finding]). A failing API call is a FAIL (nothing was verified), never guessed; so is an
     entity the API would not count (403/404/rate limit), which is reported per entity (`item`) instead of vanishing."""
     try:
@@ -1152,6 +1383,9 @@ def live_bounds(live, owner, name, label):
         return {}, [finding("FAIL", "live_check_failed", f"{label}: live API check failed, counts NOT verified: "
                             f"{type(e).__name__}: {e}")]
     errs = api.pop("_errors", None) or {}
+    vis = api.pop("visibility", None)    # a string, informational: not a count and never a live_check_failed
+    if side is not None:
+        side["visibility"] = vis
     skipped = [(k, errs.get(k, "no answer")) for k, v in api.items() if v is None]
     out = [finding("WARN" if k in SOFT_COUNTS else "FAIL", "live_check_failed",
                    f"{label}: live API could not count {k}, NOT verified ({why})", item=k) for k, why in skipped]
@@ -1188,6 +1422,26 @@ def for_check_findings(fc, label, single, mine, facts, ref_pattern, entities, re
         out.append(finding("WARN", "default_branch", f"{label}: source default branch {want!r}, archive record says "
                            f"{record_default_branch!r}", expected=want, found=record_default_branch, item="source"))
     return out + compare_counts(label, mine, bounds, "source"), bounds
+
+
+# for-check entity -> (the org-reference metric it supersedes, the name used in the extra_metrics column)
+FOR_CHECK_SUPERSEDES = {"prs": ("prs", "prs_metadata"), "commits": ("commits", "commits"),
+                        "branches": ("branches", "branches"), "tags": ("tags", "tags")}
+
+
+def apply_for_check_reference(m, mine, bounds):
+    """The for-check holds the SOURCE's own counts, so for the metrics it bounds it outranks any org reference (the profiler
+    re-run or the client's summary): batch.compare_metrics skips them and flags ORG_SUPERSEDED. What the archive holds above
+    the for-check's upper bound is an extra, reported in the extra_metrics column."""
+    sup, extras = [], []
+    for ent, (metric, name) in FOR_CHECK_SUPERSEDES.items():
+        if ent not in bounds:
+            continue
+        sup.append(metric)
+        a, hi = mine.get(ent), bounds[ent][1]
+        if a is not None and a > hi:
+            extras.append((name, a - hi, hi))
+    m["for_check_supersedes"], m["for_check_extras"] = sup, extras
 
 
 def for_check_orphans(fc, labels):
@@ -1374,10 +1628,11 @@ def check_github(root: Path, live, scan_lfs, want_loc, fc=None, ctx=None):
         for r in recs:
             by_type.setdefault(str(r.get("type") or KIND_TYPE.get(kind, kind)), []).append(r)
     for kind, recs in by_type.items():
-        gaps = incomplete_records(recs, CORE_FIELDS.get(kind, []))
+        gaps = incomplete_records(recs, CORE_FIELDS.get(kind, []), PEER_GROUP.get(kind))
         if gaps:
-            uf.append(finding("FAIL", "record_incomplete", f"{kind}: {len(gaps)} field(s) missing from records, e.g. "
-                              f"{gaps[:3]}", missing=capped(gaps), item=kind))
+            uf.append(finding("FAIL", "record_incomplete", f"{kind}: {len(gaps)} field(s) missing from "
+                              f"{len({g.rsplit(':', 1)[0] for g in gaps})} record(s), e.g. {gaps[:3]}",
+                              missing=capped(gaps), item=kind))
     usable = fc if fc and not fc.error else None
     if usable and repos:
         uf += repo_export_findings(usable, root)
@@ -1391,7 +1646,7 @@ def check_github(root: Path, live, scan_lfs, want_loc, fc=None, ctx=None):
             if not g.name.endswith(".wiki.git"):
                 present[f"{g.parent.name}/{g.name[:-4]}".lower()] = g
     S = SimpleNamespace(kinds=kinds, idx=index_by_repo(kinds), single=len(repos) == 1, present=present, fc=usable,
-                        live=live, scan_lfs=scan_lfs, want_loc=want_loc, evidence={}, ctx=ctx)
+                        live=live, scan_lfs=scan_lfs, want_loc=want_loc, evidence={}, soft={}, ctx=ctx)
     listed = set()
     for r in repos:
         owner, name = split_name(r.get("url"), r)
@@ -1459,6 +1714,10 @@ def kind_findings(S):
             out.append(finding("FAIL", "kind_missing", f"{kind}: no records exported, but {why[0]}"
                                + (f" (+{len(why) - 1} more reason(s))" if len(why) > 1 else ""),
                                missing=capped(why, 10), item=kind))
+        elif S.soft.get(kind):
+            out.append(finding("WARN", "kind_missing", f"{kind}: no records exported, but {S.soft[kind][0]} "
+                               f"(imported history: those numbers may belong to the repo's earlier life)",
+                               missing=capped(S.soft[kind], 10), item=kind))
         else:
             out.append(finding("INFO", "kind_absent", f"{kind}: no records in the export (none, or the file is "
                                f"missing/empty); nothing proves it should have any", item=kind))
@@ -1490,6 +1749,8 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
         out = list(idx.get(key, {}).get(kind, []))
         return out + idx.get(None, {}).get(kind, []) if single else out
 
+    vis = visibility_of(r)
+    rec["metrics"]["visibility"] = vis
     bare = S.present.get(f"{owner}/{name}".lower())
     if bare is None:
         rel = f"repositories/{owner}/{name}.git"
@@ -1503,9 +1764,13 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
     gf, facts = git_facts(bare, label, S.scan_lfs, S.want_loc, r.get("default_branch"), empty_ok, label)
     f += gf
     f += created_vs_first_commit(label, r.get("created_at"), facts.get("first_commit_ts"))
-    m = rec["metrics"] = dict(facts["metrics"])
+    m = rec["metrics"] = dict(facts["metrics"], visibility=vis)
+    if r.get("fork"):
+        m["fork"] = True
+    m["base_force_pushes"] = sum(1 for e in of_repo("issue_events") if e.get("event") == "base_ref_force_pushed")
     prs = of_repo("pull_requests")
     meta_prs = {n for n in (num_of(p.get("url")) or int_or_none(p.get("number")) for p in prs) if n is not None}
+    set_pr_categories(m, pr_categories(prs, lambda p: num_of(p.get("url")) or int_or_none(p.get("number"))))
     pr_nums = facts["pr_numbers"]
     m["prs_git"], m["prs_meta"] = len(pr_nums), len(meta_prs)
     if meta_prs or (fc and fkey and any(fc.ref_snapshots(fkey))):
@@ -1518,7 +1783,11 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
                          f"{label}: git history has {len(pr_nums)} PR(s) ({facts['pr_source']}), "
                          f"metadata has {len(meta_prs)}; missing: {missing[:20]}{'...' if len(missing) > 20 else ''}",
                          expected=len(pr_nums), found=len(meta_prs), missing=capped(missing)))
-        note(S, "pull_requests", f"git has {len(pr_nums)} PR(s) ({facts['pr_source']}), e.g. #{missing[0]}")
+        why = f"git has {len(pr_nums)} PR(s) ({facts['pr_source']}), e.g. #{missing[0]}"
+        if foreign and facts["pr_source"] == "commit-messages":
+            S.soft.setdefault("pull_requests", []).append(why)   # numbers from an earlier life: a hint, not proof
+        else:
+            note(S, "pull_requests", why)
     issues = of_repo("issues")
     if meta_prs and facts["refs_known"]:
         if facts["pr_ref_count"] == 0:
@@ -1553,6 +1822,14 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
                          f"no exported record has that number", missing=capped(bare_only), item="mentions"))
     by_num = {num_of(p.get("url")): p for p in prs}
     unmerged = sorted(n for n in facts["merge_prs"] if n in by_num and not by_num[n].get("merged_at"))
+    imported = [n for n in unmerged if facts["merge_info"].get(n)
+                and foreign_merge(facts["merge_info"][n], by_num[n], r.get("created_at"))]
+    unmerged = [n for n in unmerged if n not in imported]
+    if imported:
+        m["imported_prs"] = True
+        f.append(finding("WARN", "pr_state", f"{label}: merge commit(s) for PR(s) {imported[:10]} predate this repo or "
+                         f"name another head branch than the PR record of that number; the numbers likely belong to "
+                         f"the repo's earlier life, so the unmerged metadata is not judged"))
     if unmerged:
         f.append(finding("FAIL", "pr_state", f"{label}: git has a merge commit for PR(s) {unmerged[:10]} but the "
                          f"metadata shows them unmerged (merged_at empty)", missing=[f"#{n}" for n in unmerged]))
@@ -1585,7 +1862,7 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
             f.append(finding(level, "commits", f"{label}: {len(lost)} commit sha(s) referenced by metadata are not "
                              f"in the archive's git" + ("" if level == "FAIL" else " (test merge / fork / force-pushed "
                              "commits can legitimately be absent)") + f": {[x[:10] for x in lost[:5]]}",
-                             missing=capped(lost)))
+                             expected=len(group), found=len(group) - len(lost), missing=capped(lost)))
     # real archives embed labels/milestones in the repository record; keep the standalone files as a fallback
     labels = set(ref_urls(r.get("labels")))
     labels |= {u for u in (x.get("url") for x in of_repo("labels")) if isinstance(u, str)}
@@ -1641,12 +1918,17 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
                 "review_comments": len(of_repo("pull_request_review_comments")),
                 "commit_comments": len(of_repo("commit_comments")), "branches": m.get("branches"),
                 "tags": m.get("tags"), "collaborators": collab_n, "commits": m.get("commits_head")}
-        bounds = {}
+        bounds, side = {}, {}
         if S.live:
-            bounds, live_f = live_bounds(S.live, owner, name, label)
+            bounds, live_f = live_bounds(S.live, owner, name, label, side)
         fc_f, fc_bounds = for_check_findings(fc, label, single, mine, facts, GITHUB_REF, COUNT_ENTITIES,
                                              r.get("default_branch"))
         f += fc_f
+        apply_for_check_reference(m, mine, fc_bounds)
+        others = [("live API", side.get("visibility"))]
+        if fc and fkey:
+            others.append(("for-check", fc.source_visibility(fkey)))
+        f += visibility_findings(label, vis, others)
         # an entity the for-check already bounds is verified by it; the live API is only the fallback
         f += [x for x in (live_f if S.live else []) if x.get("item") not in fc_bounds]
         for src in (fc_bounds, bounds):
@@ -1710,7 +1992,8 @@ def check_gitlab(root: Path, work: Path, scan_lfs, want_loc, fallback_name, fc=N
             ok, data = read_json(pj_path, f)
             pj = data if ok and isinstance(data, dict) else {}
     label = str_of(pj.get("path_with_namespace")) or str_of(pj.get("name")) or fallback_name
-    rec = {"repo": label, "provider": "gitlab", "findings": f, "metrics": {}}
+    vis = visibility_of(pj)
+    rec = {"repo": label, "provider": "gitlab", "findings": f, "metrics": {"visibility": vis}}
     tree = root / "tree" / "project"
     if not tree.is_dir():
         f.append(finding("FAIL", "metadata", "tree/project/ missing"))
@@ -1762,12 +2045,13 @@ def check_gitlab(root: Path, work: Path, scan_lfs, want_loc, fallback_name, fc=N
                                          f"may be incomplete: {fr.stderr.strip()[:200]}"))
                     gf, facts = git_facts(clone, bundle.name, scan_lfs, want_loc, slug=label)
                     f += [x for x in gf if x["check"] != "lfs"]  # GitLab exports carry LFS objects: judged below
-                    rec["metrics"] = dict(facts["metrics"])
+                    rec["metrics"] = dict(facts["metrics"], visibility=vis)
                     listed_oids |= facts["lfs_oids"]
             except CmdTimeout as e:
                 f.append(timeout_finding(bundle.name, e))
         finally:
             shutil.rmtree(holder, ignore_errors=True)
+    set_pr_categories(rec["metrics"], pr_categories(nd.get("merge_requests", []), lambda x: int_or_none(x.get("iid"))))
     if facts:
         have = {x.get("iid") for x in nd.get("merge_requests", [])}
         rec["metrics"]["prs_git"], rec["metrics"]["prs_meta"] = len(facts["pr_numbers"]), len(have)
@@ -1813,7 +2097,12 @@ def check_gitlab(root: Path, work: Path, scan_lfs, want_loc, fallback_name, fc=N
     mine = {"issues": len(nd.get("issues", [])), "prs": len(nd.get("merge_requests", [])), "labels": len(titles),
             "milestones": len(nd.get("milestones", [])), "releases": len(nd.get("releases", [])),
             "branches": m.get("branches"), "tags": m.get("tags"), "commits": m.get("commits_head")}
-    f += for_check_findings(fc, label, True, mine, facts or {}, GITLAB_REF, GITLAB_ENTITIES, pj.get("default_branch"))[0]
+    gl_f, gl_bounds = for_check_findings(fc, label, True, mine, facts or {}, GITLAB_REF, GITLAB_ENTITIES, pj.get("default_branch"))
+    f += gl_f
+    apply_for_check_reference(m, mine, gl_bounds)
+    fkey = fc.match_repo(label, True) if fc and not fc.error else None
+    if fkey:
+        f += visibility_findings(label, vis, [("for-check", fc.source_visibility(fkey))])
     return uf, [rec]
 
 
@@ -1954,6 +2243,9 @@ def github_live(token, api_base="https://api.github.com"):
             errors[name] = f"{type(e).__name__}: {e}"[:200]
             return None
 
+    def repo_visibility(base):
+        return visibility_of(call(base)[0])
+
     def live(owner, repo):
         errors.clear()
         base = f"/repos/{owner}/{repo}"
@@ -1966,7 +2258,8 @@ def github_live(token, api_base="https://api.github.com"):
                "branches": safe("branches", count_list, f"{base}/branches"),
                "tags": safe("tags", count_list, f"{base}/tags"),
                "collaborators": safe("collaborators", count_list, f"{base}/collaborators?affiliation=all"),
-               "commits": safe("commits", last_page, f"{base}/commits")}
+               "commits": safe("commits", last_page, f"{base}/commits"),
+               "visibility": safe("visibility", repo_visibility, base)}
         out["_errors"] = dict(errors)
         return out
     return live
