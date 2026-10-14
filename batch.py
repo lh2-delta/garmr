@@ -56,7 +56,7 @@ SPACE_FACTOR = 3.2
 MAX_ZIP_DEPTH = 2
 BRANCH_DIFF_PCT = 25
 
-REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "for_check",
+REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "gaps", "for_check",
                "commits_head",
                "commits_all", "measured_branch", "measured_by", "commits_measured", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "visibility", "extra_metrics", "history_tags", "labels", "issues",
                "branches", "tags", "files", "loc",
@@ -725,6 +725,21 @@ def missing_rows(rec):
     return rows
 
 
+GAP_CHECKS = ("commits", "pull_requests")
+
+
+def gaps_column(rows):
+    """`commits=3/120;pull_requests=1/40`: missing/expected for the failed count-based checks, taken from the very rows
+    missing_items.csv gets (`rows` = missing_rows output). Information only, never read by Garmr's verdict."""
+    out = []
+    for r in rows:
+        miss, exp = r["missing_count"], r["expected"]
+        if (r["repo"] != "*" and r["check"] in GAP_CHECKS and isinstance(miss, int) and isinstance(exp, int)
+                and exp > 0):
+            out.append((GAP_CHECKS.index(r["check"]), f"{r['check']}={miss}/{exp}"))
+    return ";".join(g for _, g in sorted(out))
+
+
 def c_no_archive_row(fc, archive=""):
     return {c: "" for c in REPORT_COLS} | {
         "repo": fc.label, "provider": fc.meta.get("provider") or "unknown", "archive": archive, "status": "NO_ARCHIVE",
@@ -798,8 +813,8 @@ def build_rows(rec, st):
         "repo": rec["repo"], "provider": rec["provider"], "archive": rec["archive"],
         "status": "INCOMPLETE" if fails else "COMPLETE", "errors": len(fails), "warnings": len(warns),
         "warned_checks": ";".join(sorted({x["check"] for x in warns})),
-        "failed_checks": ";".join(sorted({x["check"] for x in fails})), "for_check": rec["for_check"],
-        "commits_head": m.get("commits_head", ""), "commits_all": m.get("commits_all", ""),
+        "failed_checks": ";".join(sorted({x["check"] for x in fails})), "gaps": "",
+        "for_check": rec["for_check"], "commits_head": m.get("commits_head", ""), "commits_all": m.get("commits_all", ""),
         "measured_branch": m.get("measured_branch", ""), "measured_by": m.get("measured_by", ""),
         "commits_measured": m.get("commits_measured", ""),
         "prs_git": m.get("prs_git", ""), "prs_meta": m.get("prs_meta", ""),
@@ -810,8 +825,9 @@ def build_rows(rec, st):
         "files": m.get("files", ""), "loc": "" if m.get("loc") is None else m["loc"],
         "org_csv_row": row_state, **{f"org_{k}": ("" if vals.get(k) is None else vals[k]) for k in ORG_METRICS},
         "flags": ";".join(flags)}
-    out = []
-    for r in missing_rows(rec):
+    out, mrows = [], missing_rows(rec)
+    row["gaps"] = gaps_column(mrows)
+    for r in mrows:
         if r["repo"] == "*":
             key = (r["archive"], r["check"], r["item"], r["detail"])
             if key in st["seen_star"]:

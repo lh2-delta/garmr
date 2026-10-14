@@ -1862,7 +1862,7 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
             f.append(finding(level, "commits", f"{label}: {len(lost)} commit sha(s) referenced by metadata are not "
                              f"in the archive's git" + ("" if level == "FAIL" else " (test merge / fork / force-pushed "
                              "commits can legitimately be absent)") + f": {[x[:10] for x in lost[:5]]}",
-                             missing=capped(lost)))
+                             expected=len(group), found=len(group) - len(lost), missing=capped(lost)))
     # real archives embed labels/milestones in the repository record; keep the standalone files as a fallback
     labels = set(ref_urls(r.get("labels")))
     labels |= {u for u in (x.get("url") for x in of_repo("labels")) if isinstance(u, str)}

@@ -8,7 +8,7 @@ import batch  # noqa: E402
 import check_export as ce  # noqa: E402
 from conftest import build_github_tree, tar_it  # noqa: E402
 
-REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "for_check", "commits_head",
+REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "gaps", "for_check", "commits_head",
                "commits_all", "measured_branch", "measured_by", "commits_measured", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "visibility", "extra_metrics", "history_tags", "labels", "issues",
                "branches", "tags", "files", "loc",
                "org_csv_row", "org_commits", "org_loc", "org_prs", "org_branches", "org_tags", "org_files", "flags"]
@@ -162,3 +162,77 @@ def test_main_refuses_to_run_without_scc(tmp_path, monkeypatch, capsys):
     assert batch.main([]) == 2
     assert "scc is not installed" in capsys.readouterr().err
     assert not (out / "completeness_report.csv").exists()
+
+
+# ---------------------------------------------------------------- gaps column
+
+def run_tree(tmp_path, mutate=None, prs=(1, 2, 3), pr_meta=None):
+    inp, out, work = tmp_path / "in", tmp_path / "out", tmp_path / "work"
+    inp.mkdir()
+    tree = build_github_tree(tmp_path / "t_gaps", prs=prs, pr_meta=pr_meta)
+    if mutate:
+        mutate(tree)
+    tar_it(tree, inp / "acme-widgets.tar.gz")
+    batch.run(inp, out, work)
+    return read(out / "completeness_report.csv"), read(out / "missing_items.csv")
+
+
+def lost_merge_commits(n):
+    """PR records marked merged whose merge_commit_sha is not in the archive's git: n distinct lost commits."""
+    def mutate(tree):
+        import json
+        p = tree / "pull_requests_000001.json"
+        recs = json.loads(p.read_text())
+        for i, r in enumerate(recs[:n]):
+            r["merged_at"] = "2025-01-02T00:00:00Z"
+            r["merge_commit_sha"] = f"{i + 1:x}" * 40
+        p.write_text(json.dumps(recs))
+    return mutate
+
+
+def test_gaps_missing_pr(tmp_path):
+    rep, miss = run_tree(tmp_path, pr_meta=[1, 3])
+    row = [m for m in miss if m["check"] == "pull_requests"][0]
+    assert rep[0]["gaps"] == f"pull_requests={row['missing_count']}/{row['expected']}" == "pull_requests=1/3"
+
+
+def test_gaps_missing_commit(tmp_path):
+    rep, miss = run_tree(tmp_path, mutate=lost_merge_commits(1))
+    row = [m for m in miss if m["check"] == "commits"][0]
+    assert rep[0]["gaps"] == f"commits={row['missing_count']}/{row['expected']}" == "commits=1/1"
+    assert rep[0]["status"] == "INCOMPLETE"
+
+
+def test_gaps_both(tmp_path):
+    rep, miss = run_tree(tmp_path, mutate=lost_merge_commits(2), prs=(1, 2, 3, 4), pr_meta=[1, 2, 3])
+    assert rep[0]["gaps"] == "commits=2/2;pull_requests=1/4"
+    for chk in ("commits", "pull_requests"):
+        row = [m for m in miss if m["check"] == chk][0]
+        assert f"{chk}={row['missing_count']}/{row['expected']}" in rep[0]["gaps"].split(";")
+
+
+def test_gaps_blank_when_complete(tmp_path):
+    rep, _ = run_tree(tmp_path)
+    assert rep[0]["status"] == "COMPLETE" and rep[0]["gaps"] == ""
+
+
+def test_gaps_blank_for_non_count_failure(tmp_path):
+    inp, out, work = setup(tmp_path)
+    a = inp / "acme-widgets.tar.gz"
+    a.write_bytes(a.read_bytes()[: a.stat().st_size // 2])
+    batch.run(inp, out, work)
+    rep = read(out / "completeness_report.csv")
+    assert "gaps" in rep[0] and rep[0]["failed_checks"] == "archive_integrity" and rep[0]["gaps"] == ""
+
+
+def test_gaps_blank_when_unlisted_check_fails(tmp_path):
+    rows = [{"org": "acme", "repo": "widgets", "total_commits": "999", "loc": "", "merged_prs": "3"}]
+    rep, _, _ = run(tmp_path, org_rows=rows)
+    assert rep[0]["failed_checks"] == "org_report_mismatch" and rep[0]["gaps"] == ""
+
+
+def test_gaps_column_on_no_archive_row(tmp_path):
+    rows = [{"org": "acme", "repo": "ghost", "total_commits": "5", "loc": "", "merged_prs": ""}]
+    rep, _, _ = run(tmp_path, org_rows=rows)
+    ghost = [r for r in rep if r["repo"] == "acme/ghost"][0]
+    assert ghost["status"] == "NO_ARCHIVE" and ghost["gaps"] == ""
