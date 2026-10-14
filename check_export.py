@@ -739,6 +739,44 @@ def latest_branch(bare: Path, default_branch=None):
     return default_branch if default_branch in tied else tied[0]
 
 
+_BRANCH_MAPS: dict = {}
+
+
+def branch_override(label):
+    """The branch a caller asked Garmr to measure for this repo, or ''. GARMR_BRANCH_MAP is the path of a JSON object
+    {"owner/name": "branch", "name": "branch"} (keys lower-case; the full label is tried before the bare name). The client's
+    summary names the branch its numbers were measured on, and only that branch makes the comparison like with like. An
+    unreadable or malformed map is ignored, so a bad file never fails a check."""
+    path = os.environ.get("GARMR_BRANCH_MAP", "").strip()
+    if not path:
+        return ""
+    try:
+        mtime = os.stat(path).st_mtime
+        cached = _BRANCH_MAPS.get(path)
+        if not cached or cached[0] != mtime:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            clean = {str(k).lower(): v for k, v in data.items() if isinstance(v, str) and v} if isinstance(data, dict) else {}
+            _BRANCH_MAPS[path] = cached = (mtime, clean)
+    except (OSError, ValueError):
+        return ""
+    lab = (label or "").lower()
+    for key in (lab, lab.rpartition("/")[2]):
+        if key and key in cached[1]:
+            return cached[1][key]
+    return ""
+
+
+def choose_branch(bare: Path, default_branch=None, label=None):
+    """(branch, how) to measure. how: 'client' when the branch map names a branch that exists in this archive (it wins over
+    everything, even GARMR_USE_DEFAULT_BRANCH), 'newest' when the newest-commit rule chose one, '' when the default branch stays."""
+    want = branch_override(label)
+    if want and git(bare, "show-ref", "--verify", "--quiet", f"refs/heads/{want}").returncode == 0:
+        return want, "client"
+    name = latest_branch(bare, default_branch)
+    return (name, "newest") if name else ("", "")
+
+
 def imported_history(created_at, first_ts):
     """True when the first commit is older than the repository record itself (import, mirror, recreation)."""
     if not created_at or first_ts is None:
@@ -938,9 +976,10 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
         # the for-check's commit count is the platform's default-branch history, so this stays on the default branch
         metrics["commits_head"] = git_int(bare, "rev-list", "--count", default_ref)
     # everything else is measured on the branch with the newest commit (the rule the profiler uses), falling back to the default
-    measured = latest_branch(bare, default_branch) if refs else ""
+    measured, by = choose_branch(bare, default_branch, label) if refs else ("", "")
     ref = f"refs/heads/{measured}" if measured else default_ref
     metrics["measured_branch"] = measured or (default_branch or "")
+    metrics["measured_by"] = by or "default"
     if refs and git(bare, "rev-parse", "--verify", "-q", ref).returncode == 0:
         metrics["commits_measured"] = git_int(bare, "rev-list", "--count", ref)
         metrics["files"] = sum(1 for _ in git_lines(bare, "ls-tree", "-r", "--name-only", ref))

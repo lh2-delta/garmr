@@ -77,6 +77,62 @@ def test_old_behaviour_when_asked(tmp_path, monkeypatch):
     assert m["measured_branch"] == "master" and m["commits_measured"] == m["commits_head"] == 1 and m["files"] == 1
 
 
+def write_map(tmp_path, data):
+    import json
+    p = tmp_path / "branches.json"
+    p.write_text(json.dumps(data) if not isinstance(data, str) else data)
+    return str(p)
+
+
+def test_measured_by_says_which_rule_chose_the_branch(tmp_path, monkeypatch):
+    bare = make_bare(tmp_path)
+    assert facts(bare)["measured_by"] == "newest"
+    monkeypatch.setenv("GARMR_USE_DEFAULT_BRANCH", "1")
+    assert facts(bare)["measured_by"] == "default"
+
+
+def test_a_branch_map_wins_over_the_newest_branch(tmp_path, monkeypatch):
+    bare = make_bare(tmp_path)                                           # newest: feature (3 commits); master has 1
+    monkeypatch.setenv("GARMR_BRANCH_MAP", write_map(tmp_path, {"acme/x": "master"}))
+    m = facts(bare)
+    assert (m["measured_branch"], m["measured_by"], m["commits_measured"], m["files"]) == ("master", "client", 1, 1)
+
+
+def test_the_map_is_found_by_the_bare_repo_name_and_case_is_ignored(tmp_path, monkeypatch):
+    bare = make_bare(tmp_path)
+    monkeypatch.setenv("GARMR_BRANCH_MAP", write_map(tmp_path, {"X": "master"}))
+    assert facts(bare)["measured_by"] == "client" and facts(bare)["measured_branch"] == "master"
+
+
+def test_the_full_label_is_tried_before_the_bare_name(tmp_path, monkeypatch):
+    bare = make_bare(tmp_path)
+    monkeypatch.setenv("GARMR_BRANCH_MAP", write_map(tmp_path, {"acme/x": "feature", "x": "master"}))
+    assert facts(bare)["measured_branch"] == "feature"
+
+
+def test_a_map_wins_even_over_use_default_branch(tmp_path, monkeypatch):
+    bare = make_bare(tmp_path)
+    monkeypatch.setenv("GARMR_USE_DEFAULT_BRANCH", "1")
+    monkeypatch.setenv("GARMR_BRANCH_MAP", write_map(tmp_path, {"acme/x": "feature"}))
+    assert (facts(bare)["measured_branch"], facts(bare)["measured_by"]) == ("feature", "client")
+
+
+def test_a_mapped_branch_that_is_not_in_the_archive_falls_back_to_the_newest_rule(tmp_path, monkeypatch):
+    bare = make_bare(tmp_path)
+    monkeypatch.setenv("GARMR_BRANCH_MAP", write_map(tmp_path, {"acme/x": "no-such-branch"}))
+    m = facts(bare)
+    assert (m["measured_branch"], m["measured_by"]) == ("feature", "newest")   # the caller sees the difference in measured_branch
+
+
+def test_an_unreadable_or_malformed_map_is_ignored(tmp_path, monkeypatch):
+    bare = make_bare(tmp_path)
+    for bad in ("not json at all", "[1, 2]", '{"acme/x": 5}'):
+        monkeypatch.setenv("GARMR_BRANCH_MAP", write_map(tmp_path, bad))
+        assert facts(bare)["measured_by"] == "newest", bad
+    monkeypatch.setenv("GARMR_BRANCH_MAP", str(tmp_path / "missing.json"))
+    assert facts(bare)["measured_by"] == "newest"
+
+
 def test_a_repo_with_one_branch_measures_it(tmp_path):
     from conftest import build_github_tree
     from test_visibility_prs import repo_of

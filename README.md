@@ -158,6 +158,11 @@ in `measured_branch` and counts its history in `commits_measured`. `commits_head
 for-check's commit count is the platform's default-branch history and must be compared like with like. With no branch at all,
 or with `GARMR_USE_DEFAULT_BRANCH=1`, everything stays on the default branch as before.
 
+**Client's branch.** `GARMR_BRANCH_MAP` may name a JSON file `{"org/repo" or "repo": "branch"}` (keys case-insensitive, full label
+tried before the bare name). A mapped branch that exists in the archive wins over the newest rule and over
+`GARMR_USE_DEFAULT_BRANCH`. A missing branch, unreadable file or malformed file is ignored and the normal rule applies. The report's
+`measured_by` says which rule chose: `client`, `newest` or `default`; compare `measured_branch` with the branch you asked for.
+
 **PRs** are looked for twice: the CSV's merged-PR count must be reached by the PR numbers git history names (`prs_git`) and,
 separately, by the merged PR records in the metadata (`prs_merged`; all PR records, `prs_meta`, when the export carries no
 merged_at/closed_at/state). A side that falls short makes one `org_report_mismatch` finding (item `prs`) naming the side(s); a
