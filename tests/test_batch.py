@@ -8,7 +8,7 @@ import batch  # noqa: E402
 import check_export as ce  # noqa: E402
 from conftest import build_github_tree, tar_it  # noqa: E402
 
-REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "gaps", "for_check", "commits_head",
+REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "gaps", "excess", "for_check", "commits_head",
                "commits_all", "measured_branch", "measured_by", "commits_measured", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "visibility", "extra_metrics", "history_tags", "labels", "issues",
                "branches", "tags", "files", "loc",
                "org_csv_row", "org_commits", "org_loc", "org_prs", "org_branches", "org_tags", "org_files", "flags"]
@@ -225,10 +225,12 @@ def test_gaps_blank_for_non_count_failure(tmp_path):
     assert "gaps" in rep[0] and rep[0]["failed_checks"] == "archive_integrity" and rep[0]["gaps"] == ""
 
 
-def test_gaps_blank_when_unlisted_check_fails(tmp_path):
+def test_gaps_org_mismatch_is_listed(tmp_path):
     rows = [{"org": "acme", "repo": "widgets", "total_commits": "999", "loc": "", "merged_prs": "3"}]
-    rep, _, _ = run(tmp_path, org_rows=rows)
-    assert rep[0]["failed_checks"] == "org_report_mismatch" and rep[0]["gaps"] == ""
+    rep, miss, _ = run(tmp_path, org_rows=rows)
+    row = [m for m in miss if m["check"] == "org_report_mismatch"][0]
+    assert rep[0]["failed_checks"] == "org_report_mismatch"
+    assert rep[0]["gaps"] == f"org_report_mismatch:commits={row['missing_count']}/999"
 
 
 def test_gaps_column_on_no_archive_row(tmp_path):

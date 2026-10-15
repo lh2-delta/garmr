@@ -56,7 +56,7 @@ SPACE_FACTOR = 3.2
 MAX_ZIP_DEPTH = 2
 BRANCH_DIFF_PCT = 25
 
-REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "gaps", "for_check",
+REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "gaps", "excess", "for_check",
                "commits_head",
                "commits_all", "measured_branch", "measured_by", "commits_measured", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "visibility", "extra_metrics", "history_tags", "labels", "issues",
                "branches", "tags", "files", "loc",
@@ -725,19 +725,35 @@ def missing_rows(rec):
     return rows
 
 
-GAP_CHECKS = ("commits", "pull_requests")
+GAP_FIRST = ("commits", "pull_requests")       # always listed first, in this order
+# Checks whose failure compares a COUNT of what the archive lacks with a reference total (expected): source for-check
+# bounds (live_counts), the org CSV (org_report_mismatch), and set-membership misses whose expected is the reference
+# total (git/metadata PR numbers, merge shas, referenced labels/milestones, refs on the source, referenced uploads/LFS).
+# Not listed on purpose: integrity / structural / format checks and anything without a numeric reference.
+GAP_CHECKS = frozenset(GAP_FIRST) | {"live_counts", "org_report_mismatch", "merge_requests", "git_refs", "labels",
+                                     "milestones", "refs", "file_refs"}
 
 
 def gaps_column(rows):
-    """`commits=3/120;pull_requests=1/40`: missing/expected for the failed count-based checks, taken from the very rows
-    missing_items.csv gets (`rows` = missing_rows output). Information only, never read by Garmr's verdict."""
-    out = []
+    """`commits=3/120;pull_requests=1/40;labels=2/9;org_report_mismatch:loc=50/1000`: missing/expected for each failed
+    count-based check, taken from the very rows missing_items.csv gets (`rows` = missing_rows output). A check that
+    reports per item is `<check>:<item>`. Information only, never read by Garmr's verdict."""
+    out = {}
     for r in rows:
         miss, exp = r["missing_count"], r["expected"]
-        if (r["repo"] != "*" and r["check"] in GAP_CHECKS and isinstance(miss, int) and isinstance(exp, int)
-                and exp > 0):
-            out.append((GAP_CHECKS.index(r["check"]), f"{r['check']}={miss}/{exp}"))
-    return ";".join(g for _, g in sorted(out))
+        if (r["repo"] == "*" or r["check"] not in GAP_CHECKS or isinstance(miss, bool) or isinstance(exp, bool)
+                or not isinstance(miss, int) or not isinstance(exp, int) or exp <= 0 or miss < 0):
+            continue
+        name = r["check"] if r["item"] in ("", None, r["check"]) else f"{r['check']}:{r['item']}"
+        out.setdefault(name, f"{name}={miss}/{exp}")
+    first = [out[c] for c in GAP_FIRST if c in out]
+    return ";".join(first + [out[k] for k in sorted(out) if k not in GAP_FIRST])
+
+
+def excess_column(extras):
+    """`commits=+12/90;prs_git=+3/5`: how many more than the reference the archive holds, with the reference (>0)."""
+    return ";".join(f"{n}=+{a}/{ref}" for n, a, ref in extras
+                    if isinstance(a, int) and isinstance(ref, int) and ref > 0 and a > 0)
 
 
 def c_no_archive_row(fc, archive=""):
@@ -806,6 +822,7 @@ def build_rows(rec, st):
                                                  rec["metrics"].get("for_check_supersedes") or ())
                 rec["findings"] += errs + extra_findings(extras)
                 flags += fl
+    all_extras = extras + list(rec["metrics"].get("for_check_extras") or [])
     fails = [x for x in rec["findings"] if x["level"] == "FAIL"]
     warns = [x for x in rec["findings"] if x["level"] == "WARN"]
     m = rec["metrics"]
@@ -813,13 +830,13 @@ def build_rows(rec, st):
         "repo": rec["repo"], "provider": rec["provider"], "archive": rec["archive"],
         "status": "INCOMPLETE" if fails else "COMPLETE", "errors": len(fails), "warnings": len(warns),
         "warned_checks": ";".join(sorted({x["check"] for x in warns})),
-        "failed_checks": ";".join(sorted({x["check"] for x in fails})), "gaps": "",
+        "failed_checks": ";".join(sorted({x["check"] for x in fails})), "gaps": "", "excess": excess_column(all_extras),
         "for_check": rec["for_check"], "commits_head": m.get("commits_head", ""), "commits_all": m.get("commits_all", ""),
         "measured_branch": m.get("measured_branch", ""), "measured_by": m.get("measured_by", ""),
         "commits_measured": m.get("commits_measured", ""),
         "prs_git": m.get("prs_git", ""), "prs_meta": m.get("prs_meta", ""),
         "prs_merged": m.get("prs_merged", ""), "prs_unmerged": m.get("prs_unmerged", ""),
-        "visibility": m.get("visibility") or "unknown", "extra_metrics": extra_column(extras + list(m.get("for_check_extras") or [])),
+        "visibility": m.get("visibility") or "unknown", "extra_metrics": extra_column(all_extras),
         "history_tags": ";".join(ce.history_tags(rec["findings"], m)), "labels": m.get("labels", ""),
         "issues": m.get("issues", ""), "branches": m.get("branches", ""), "tags": m.get("tags", ""),
         "files": m.get("files", ""), "loc": "" if m.get("loc") is None else m["loc"],

@@ -79,7 +79,7 @@ All files are created mode `0600` (owner only), since they list repo names and w
 
 | File | Contents |
 |---|---|
-| `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `gaps` (information only, see "Gaps column" below), `for_check` (`yes` / `no` / `unreadable` / `empty`), counts found in the archive, the org's numbers, `flags`. `visibility`: `public` / `private` / `internal` / `unknown`, read from the repository record (GitHub `private`, GitLab `visibility` / `visibility_level` 20 / 10 / 0, Bitbucket `is_private`); `unknown` when the record lacks it, is unreadable or the layout is plain git, never guessed. `prs_merged` / `prs_unmerged`: counts of distinct PR (GitHub) / MR (GitLab) records in the metadata. merged = non-empty `merged_at` (or state `merged`); unmerged = every other record, closed without a merge and still open alike (one combined count, no separate "open"). `state` is only the fallback (GitHub export records carry none). A number with several records counts once, as merged if any of them is. The two are blank (not 0) when the export carries no PR/MR records, the layout has none (plain git), or a record has none of `merged_at` / `closed_at` / `state`. `prs_git` and `prs_meta` are unchanged. `extra_metrics` (what the archive holds more of than the reference, e.g. `prs_git:+3;commits:+12`) and `history_tags` (`imported`, `forked`, `suspected_forged`, `flattened`, `rewritten`, `faulty`) are described under "Org metrics CSV" below |
+| `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `gaps` (information only, see "Gaps column" below), `excess` (information only, same section), `for_check` (`yes` / `no` / `unreadable` / `empty`), counts found in the archive, the org's numbers, `flags`. `visibility`: `public` / `private` / `internal` / `unknown`, read from the repository record (GitHub `private`, GitLab `visibility` / `visibility_level` 20 / 10 / 0, Bitbucket `is_private`); `unknown` when the record lacks it, is unreadable or the layout is plain git, never guessed. `prs_merged` / `prs_unmerged`: counts of distinct PR (GitHub) / MR (GitLab) records in the metadata. merged = non-empty `merged_at` (or state `merged`); unmerged = every other record, closed without a merge and still open alike (one combined count, no separate "open"). `state` is only the fallback (GitHub export records carry none). A number with several records counts once, as merged if any of them is. The two are blank (not 0) when the export carries no PR/MR records, the layout has none (plain git), or a record has none of `merged_at` / `closed_at` / `state`. `prs_git` and `prs_meta` are unchanged. `extra_metrics` (what the archive holds more of than the reference, e.g. `prs_git:+3;commits:+12`) and `history_tags` (`imported`, `forked`, `suspected_forged`, `flattened`, `rewritten`, `faulty`) are described under "Org metrics CSV" below |
 | `missing_items.csv` | only errors: one row per failed check with `expected`, `found`, `missing_count`, `missing_items` (e.g. PR numbers in git but with no metadata record). `missing_items` lists at most 200 examples; `missing_count` is always the real total |
 | `run_notes.txt` | non-fatal notices: CSVs skipped or unused, `.xlsx` files not read, archives that were not checked |
 
@@ -90,13 +90,34 @@ removed at start, so a file in `output/` always belongs to the run that wrote it
 ### Gaps column
 
 `completeness_report.csv` has a `gaps` column right after `failed_checks`: `;`-separated `<check>=<missing>/<expected>` for each
-FAILED `commits` and `pull_requests` check, e.g. `commits=3/120;pull_requests=1/40`. The numbers are the `missing_count` and
-`expected` of that check's row in `missing_items.csv`, so the two files always agree. For `commits`, expected is the number of
-distinct merge commits the metadata references and missing is how many of them are absent from the archive's git. An entry is
-written only when both numbers are known integers and expected > 0; the column is blank when neither check failed, when the
-failure is of another kind (`archive_integrity`, `org_report_mismatch`, ...), and on `NO_ARCHIVE` rows. WARN-only checks are never
-listed. It is information only: Garmr stays strict and `status` / `failed_checks` ignore it. Squirrel reads it to apply its own 5%
-tolerance to these count-based failures; the tolerance is not applied here.
+FAILED check that compares a COUNT with a numeric reference, e.g.
+`commits=3/120;pull_requests=1/40;live_counts:issues=4/5;org_report_mismatch:loc=50/1000`. The numbers are the `missing_count`
+and `expected` of that check's row in `missing_items.csv`, so the two files always agree. An entry is written only when both are
+known integers, expected > 0 and the finding is a FAIL (WARN-only checks never appear). A check that reports per item is written
+`<check>:<item>` so entries are unique. Order: `commits` and `pull_requests` first, then the rest sorted by name.
+
+Listed checks:
+
+- `commits`: expected = distinct merge commits the metadata references, missing = absent from the archive's git.
+- `pull_requests` / `merge_requests`: expected = PR (MR) numbers git history shows, missing = no metadata record.
+- `git_refs`: expected = PRs the metadata lists, missing = no `refs/pull/N/head` in git.
+- `labels`, `milestones`: expected = labels (milestones) that issues/PRs reference, missing = not exported.
+- `live_counts:<entity>`: the for-check's source counts (issues, labels, milestones, releases, issue/review/commit comments, branches, tags, commits, prs) against the archive; expected = the source's number.
+- `org_report_mismatch:<item>`: the org CSV's number (commits, loc, prs, branches, tags, files) against the archive.
+- `refs`: branches/tags on the source before and after the export that the archive's git lacks (expected = those refs).
+- `file_refs:uploads` / `file_refs:lfs`: referenced uploads / LFS objects absent (expected = how many are referenced).
+
+Deliberately never listed: `archive_integrity`, `git_integrity` (fsck), `page_sequence`, `page_partial`, `repo_git`, `zero_byte`,
+`metadata_json`, `record_incomplete`, `required_file`, `layout`, schema/format, hash/checksum, `history_forgery`,
+`repo_not_exported`, `for_check_*`, `live_check_failed`, `dangling_reference`, `file_refs` without a numeric reference, and the
+named-item misses with no reference total (`events_parent`, `comments_parent`, `pr_state`, `release_tag`, `default_branch`,
+`number_refs`). They say the archive is broken or unverifiable, not that a number is short, so a percentage tolerance would be
+meaningless. Blank on `NO_ARCHIVE` rows. It is information only: Garmr stays strict and `status` / `failed_checks` ignore it.
+Squirrel reads it to apply its own 5% tolerance; the tolerance is not applied here.
+
+The `excess` column follows `gaps`: `;`-separated `<metric>=+<extra>/<reference>` for each metric where the archive holds MORE than
+the reference (the same data as `extra_metrics`, which stays `name:+amount`), e.g. `commits=+12/90;prs_git=+3/5`. Sources: org CSV
+and for-check upper bounds. Only when the reference is a known integer > 0; blank otherwise. Never affects status.
 
 ### Statuses and flags
 
