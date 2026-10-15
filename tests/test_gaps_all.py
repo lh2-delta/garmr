@@ -88,7 +88,7 @@ def test_gaps_filter_rules_unit():
             row("repo_not_exported", "requested", 10, 2), row("labels", "labels", 0, 0),
             row("labels", "labels", 4, ""), row("refs", "refs", 8, 1), row("file_refs", "uploads", 5, 5),
             row("commits", "commits", 3, 1, repo="*")]
-    assert batch.gaps_column(rows) == "file_refs:uploads=5/5;refs=1/8"
+    assert batch.gaps_column(rows) == "refs=1/8"   # file_refs (uploads, LFS) is never listed: attachments are not tolerated
 
 
 def test_excess_for_check(tmp_path):

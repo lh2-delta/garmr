@@ -728,10 +728,11 @@ def missing_rows(rec):
 GAP_FIRST = ("commits", "pull_requests")       # always listed first, in this order
 # Checks whose failure compares a COUNT of what the archive lacks with a reference total (expected): source for-check
 # bounds (live_counts), the org CSV (org_report_mismatch), and set-membership misses whose expected is the reference
-# total (git/metadata PR numbers, merge shas, referenced labels/milestones, refs on the source, referenced uploads/LFS).
-# Not listed on purpose: integrity / structural / format checks and anything without a numeric reference.
+# total (git/metadata PR numbers, merge shas, referenced labels/milestones, refs on the source).
+# Not listed on purpose: integrity / structural / format checks and anything without a numeric reference. file_refs (uploads, LFS
+# objects) has a numeric reference but stays out: a missing attachment is content nobody can recreate, so it is never tolerated.
 GAP_CHECKS = frozenset(GAP_FIRST) | {"live_counts", "org_report_mismatch", "merge_requests", "git_refs", "labels",
-                                     "milestones", "refs", "file_refs"}
+                                     "milestones", "refs"}
 
 
 def gaps_column(rows):

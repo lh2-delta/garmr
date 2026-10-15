@@ -105,11 +105,11 @@ Listed checks:
 - `live_counts:<entity>`: the for-check's source counts (issues, labels, milestones, releases, issue/review/commit comments, branches, tags, commits, prs) against the archive; expected = the source's number.
 - `org_report_mismatch:<item>`: the org CSV's number (commits, loc, prs, branches, tags, files) against the archive.
 - `refs`: branches/tags on the source before and after the export that the archive's git lacks (expected = those refs).
-- `file_refs:uploads` / `file_refs:lfs`: referenced uploads / LFS objects absent (expected = how many are referenced).
 
-Deliberately never listed: `archive_integrity`, `git_integrity` (fsck), `page_sequence`, `page_partial`, `repo_git`, `zero_byte`,
+Deliberately never listed: `file_refs` (referenced uploads and LFS objects that are absent: a missing attachment is content nobody can
+recreate, so a downstream percentage tolerance must never cover it), `archive_integrity`, `git_integrity` (fsck), `page_sequence`, `page_partial`, `repo_git`, `zero_byte`,
 `metadata_json`, `record_incomplete`, `required_file`, `layout`, schema/format, hash/checksum, `history_forgery`,
-`repo_not_exported`, `for_check_*`, `live_check_failed`, `dangling_reference`, `file_refs` without a numeric reference, and the
+`repo_not_exported`, `for_check_*`, `live_check_failed`, `dangling_reference`, and the
 named-item misses with no reference total (`events_parent`, `comments_parent`, `pr_state`, `release_tag`, `default_branch`,
 `number_refs`). They say the archive is broken or unverifiable, not that a number is short, so a percentage tolerance would be
 meaningless. Blank on `NO_ARCHIVE` rows. It is information only: Garmr stays strict and `status` / `failed_checks` ignore it.
