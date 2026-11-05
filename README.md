@@ -221,7 +221,7 @@ person, built from signals Garmr already computes; suspected, never proof, and t
 |---|---|
 | `imported` | the first commit is older than the repository's `created_at` (`created_after_history`), or merge commits carry PR numbers that belong to the repo's earlier life (the `pr_state` imported-numbers WARN) |
 | `forked` | the repository record says it is a fork |
-| `suspected_forged` | a `history_forgery` signal: future-dated commits, author date after committer date, a child older than its parent, bulk same-second commits, one committer over many authors, a BAD signature |
+| `suspected_forged` | a `history_forgery` signal: future-dated commits, author date after committer date, a child older than its parent, bulk same-second commits, one committer over many authors, a BAD signature, commits dated before git existed |
 | `flattened` | one squashed commit, or several root commits |
 | `rewritten` | reflog rewrites or unreachable commits, or the platform recorded `base_ref_force_pushed` events |
 | `faulty` | a failed `git_integrity`, `repo_git` or `archive_integrity` check (missing or corrupt objects, shallow, no refs, truncated archive) |
@@ -351,5 +351,7 @@ python3 -m pytest -q
 Heuristics, not proof; a person reads them. Thresholds are named constants in `check_export.py`.
 Future-dated commits, author date after committer date, child older than parent, bulk same-second committer time,
 one committer over many authors, multiple roots, single squashed commit, unreachable commits, reflog rewrites,
-BAD gpg signature (only when the signer's key is in the keyring; unverifiable signatures are not flagged), and
-repo `created_at` newer than the first commit. Not covered: ref/commit-count upper bounds still only WARN.
+BAD gpg signature (only when the signer's key is in the keyring; unverifiable signatures are not flagged),
+repo `created_at` newer than the first commit, commits dated before git existed (2005-04-07, item `pre_git_date`) and
+commits whose author identity is a placeholder (blank, `unknown`, `root` or similar name, or an e-mail that is blank, has no
+`@` or is a local account such as `root@localhost`; item `placeholder_identity`, with the count over all commits). Not covered: ref/commit-count upper bounds still only WARN.

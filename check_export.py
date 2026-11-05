@@ -594,6 +594,8 @@ SINGLE_COMMITTER_MIN_COMMITS = 50
 SINGLE_COMMITTER_MIN_AUTHORS = 3
 SQUASH_MIN_FILES = 20            # one commit holding at least this many files looks like a flattened history
 MAX_HISTORY_COMMITS = 500_000    # bound on memory; the scan says so when it stopped early
+GIT_EPOCH = 1112832000           # 2005-04-07, git's first release: no real git commit is older
+PLACEHOLDER_NAMES = {"", "unknown", "root", "admin", "user", "none", "(none)", "nobody", "localhost"}
 REFLOG_REWRITE = re.compile(r"\((?:amend|forced)[^)]*\)|rebase|forced-update|filter-(?:branch|repo)|reset: moving", re.I)
 MAX_REFLOG_FILES, MAX_REFLOG_BYTES = 200, 2_000_000
 
@@ -623,6 +625,16 @@ def _reflog_rewrites(gitdir: Path):
     return hits
 
 
+def placeholder_identity(ident: str) -> bool:
+    """'name <email>' that names nobody: a blank or generic name, or an e-mail that is blank, has no '@' or is a local
+    account (root@localhost). Such commits cannot be attributed to a person."""
+    name, _, email = ident.partition(" <")
+    email = email.rstrip(">").strip().lower()
+    local, at, host = email.partition("@")
+    return (name.strip().lower() in PLACEHOLDER_NAMES or not at or not local or not host
+            or local in PLACEHOLDER_NAMES or host in ("localhost", "localhost.localdomain", "(none)"))
+
+
 def history_scan(bare: Path, label: str):
     """(findings, first_commit_ts) for signs of forged, rewritten or recreated history. Needs fsck to have passed."""
     out: list = []
@@ -630,8 +642,8 @@ def history_scan(bare: Path, label: str):
     commits = {}                      # sha -> (parents, committer ts)
     authors, committers = set(), set()
     ctimes: dict = {}
-    future = reversed_dates = 0
-    ex_future = ex_rev = ex_child = None
+    future = reversed_dates = pre_git = placeholder = 0
+    ex_future = ex_rev = ex_child = ex_pre = ex_ph = None
     child_older = 0
     truncated = False
     fmt = "%H%x1f%P%x1f%an <%ae>%x1f%cn <%ce>%x1f%at%x1f%ct"
@@ -657,6 +669,12 @@ def history_scan(bare: Path, label: str):
         if at > ct + SKEW_S:
             reversed_dates += 1
             ex_rev = ex_rev or sha
+        if at < GIT_EPOCH or ct < GIT_EPOCH:
+            pre_git += 1
+            ex_pre = ex_pre or sha
+        if placeholder_identity(an):
+            placeholder += 1
+            ex_ph = ex_ph or sha
     if not commits:
         return out, None
     n = len(commits)
@@ -668,6 +686,12 @@ def history_scan(bare: Path, label: str):
     if reversed_dates:
         out.append(_hw(label, f"{reversed_dates} commit(s) whose author date is later than committer date "
                        f"(e.g. {ex_rev[:12]})", found=reversed_dates, item="author_after_committer"))
+    if pre_git:
+        out.append(_hw(label, f"{pre_git} commit(s) dated before git existed (2005-04-07), e.g. {ex_pre[:12]}; "
+                       "the dates were set by hand or by a converter", found=pre_git, expected=n, item="pre_git_date"))
+    if placeholder:
+        out.append(_hw(label, f"{placeholder} of {n} commit(s) carry a placeholder author identity (blank, unknown, root or "
+                       f"no usable e-mail), e.g. {ex_ph[:12]}", found=placeholder, expected=n, item="placeholder_identity"))
     for sha, (parents, ct) in commits.items():
         for p in parents:
             pc = commits.get(p)
@@ -793,6 +817,7 @@ HISTORY_TAG_OF_SIGNAL = {
     "created_after_history": "imported",
     "future_dated": "suspected_forged", "author_after_committer": "suspected_forged", "non_monotonic": "suspected_forged",
     "bulk_timestamp": "suspected_forged", "single_committer": "suspected_forged", "bad_signature": "suspected_forged",
+    "pre_git_date": "suspected_forged",
     "multi_root": "flattened", "squashed": "flattened",
     "unreachable": "rewritten", "reflog_rewrite": "rewritten",
 }
