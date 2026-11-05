@@ -744,6 +744,101 @@ def history_scan(bare: Path, label: str):
     return out, first_ts
 
 
+# ---------------------------------------------------------------- the measured branch's tree
+TREE_ZERO_BYTE_ALLOW = {".gitkeep", ".keep", ".gitignore", ".nojekyll", "__init__.py", "py.typed", ".npmignore",
+                        ".gitattributes", ".dockerignore"}
+TREE_MODES = {"100644", "100755", "120000", "160000"}
+JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
+JUNK_DIRS = {"__macosx", "node_modules", "bower_components", "__pycache__"}
+MAX_SYMLINKS_READ = 2000
+
+
+def _examples(paths, n=5):
+    return ", ".join(paths[:n]) + (f" (+{len(paths) - n} more)" if len(paths) > n else "")
+
+
+def _gitmodules_paths(bare: Path, ref):
+    r = git(bare, "config", "--blob", f"{ref}:.gitmodules", "--get-regexp", r"^submodule\..*\.path$")
+    return {ln.split(" ", 1)[1].strip() for ln in r.stdout.splitlines() if " " in ln} if r.returncode == 0 else set()
+
+
+def tree_findings(bare: Path, ref: str, label: str):
+    """WARNs about what the tree at `ref` holds (Squirrel L2/L9/L10.4): 0-byte files outside the allowlist, file modes git
+    does not produce, symlinks that point outside the repository, submodules (gitlinks) that .gitmodules does not map, DVC /
+    git-annex pointers whose content lives elsewhere, and committed operating-system or dependency folders."""
+    zero, odd_modes, links, gitlinks, dvc, annex, junk = [], [], [], [], [], [], {}
+    for ln in git_lines(bare, "ls-tree", "-r", "-l", "--full-tree", ref):
+        meta, _, path = ln.rstrip("\n").partition("\t")
+        parts = meta.split()
+        if len(parts) != 4 or not path:
+            continue
+        mode, _kind, sha, size = parts
+        name = path.rsplit("/", 1)[-1]
+        if mode not in TREE_MODES:
+            odd_modes.append(f"{path} ({mode})")
+        if mode == "160000":
+            gitlinks.append(path)
+        elif mode == "120000":
+            links.append((path, sha))
+        elif size == "0" and name not in TREE_ZERO_BYTE_ALLOW:
+            zero.append(path)
+        if name.endswith(".dvc"):
+            dvc.append(path)
+        low = path.lower().split("/")
+        if low[-1] in JUNK_NAMES:
+            junk.setdefault(name, []).append(path)
+        for seg in low[:-1]:
+            if seg in JUNK_DIRS:
+                junk.setdefault(seg if seg != "__macosx" else "__MACOSX", []).append(path)
+                break
+    out = []
+    if zero:
+        out.append(finding("WARN", "tree_zero_byte", f"{label}: {len(zero)} 0-byte file(s) at {ref}: {_examples(zero)}",
+                           found=len(zero)))
+    if odd_modes:
+        out.append(finding("WARN", "tree_mode", f"{label}: {len(odd_modes)} file(s) with a mode git does not write: "
+                           f"{_examples(odd_modes)}", found=len(odd_modes)))
+    bad_links = []
+    for path, sha in links[:MAX_SYMLINKS_READ]:
+        r = git(bare, "cat-file", "blob", sha)
+        target = r.stdout.strip() if r.returncode == 0 else ""
+        depth = len(path.split("/")) - 1
+        for seg in target.split("/"):
+            if seg == "..":
+                depth -= 1
+            elif seg not in ("", "."):
+                depth += 1
+            if depth < 0:
+                break
+        if "/annex/objects/" in target:
+            annex.append(path)
+        elif target.startswith("/") or depth < 0:
+            bad_links.append(f"{path} -> {target}")
+    if bad_links:
+        out.append(finding("WARN", "tree_symlink", f"{label}: {len(bad_links)} symlink(s) point outside the repository: "
+                           f"{_examples(bad_links)}", found=len(bad_links)))
+    if gitlinks:
+        mapped = _gitmodules_paths(bare, ref)
+        unmapped = [p for p in gitlinks if p not in mapped]
+        if unmapped:
+            out.append(finding("WARN", "submodule", f"{label}: {len(unmapped)} submodule link(s) with no .gitmodules entry "
+                               f"saying where they point: {_examples(unmapped)}", found=len(unmapped), expected=len(gitlinks)))
+        if len(unmapped) < len(gitlinks):
+            out.append(finding("WARN", "submodule", f"{label}: {len(gitlinks) - len(unmapped)} submodule(s); their content "
+                               "is another repository and is not in this archive", found=len(gitlinks) - len(unmapped)))
+    if dvc or annex:
+        out.append(finding("WARN", "external_pointers", f"{label}: content stored outside git: "
+                           + "; ".join(x for x in (f"{len(dvc)} DVC pointer file(s) ({_examples(dvc)})" if dvc else "",
+                                                   f"{len(annex)} git-annex link(s) ({_examples(annex)})" if annex else "")
+                                       if x), found=len(dvc) + len(annex)))
+    if junk:
+        n = sum(len(v) for v in junk.values())
+        out.append(finding("WARN", "committed_junk", f"{label}: {n} committed file(s) that belong to an operating system or "
+                           "a dependency install: " + "; ".join(f"{k} ({len(v)})" for k, v in sorted(junk.items())),
+                           found=n))
+    return out
+
+
 def latest_branch(bare: Path, default_branch=None):
     """The branch (refs/heads/*) whose tip commit is newest, the same rule the profiler uses: a tie goes to the default branch,
     then to the first name in order. '' when there is no branch, or when GARMR_USE_DEFAULT_BRANCH=1 asks for the old behaviour:
@@ -1008,6 +1103,13 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
     if refs and git(bare, "rev-parse", "--verify", "-q", ref).returncode == 0:
         metrics["commits_measured"] = git_int(bare, "rev-list", "--count", ref)
         metrics["files"] = sum(1 for _ in git_lines(bare, "ls-tree", "-r", "--name-only", ref))
+        try:
+            f += tree_findings(bare, ref, label)
+        except CmdTimeout as e:
+            f.append(finding("WARN", "tree_scan", f"{label}: tree checks not completed, {e.what} timed out after "
+                             f"{e.seconds:g}s (not verified)", item="timeout"))
+        except GitError as e:
+            f.append(finding("WARN", "tree_scan", f"{label}: tree checks not completed, {e}", item="git_error"))
         if want_loc:
             try:
                 metrics["loc"] = measure_loc(bare, ref)

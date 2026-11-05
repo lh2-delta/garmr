@@ -355,3 +355,17 @@ BAD gpg signature (only when the signer's key is in the keyring; unverifiable si
 repo `created_at` newer than the first commit, commits dated before git existed (2005-04-07, item `pre_git_date`) and
 commits whose author identity is a placeholder (blank, `unknown`, `root` or similar name, or an e-mail that is blank, has no
 `@` or is a local account such as `root@localhost`; item `placeholder_identity`, with the count over all commits). Not covered: ref/commit-count upper bounds still only WARN.
+
+## Tree checks (always WARN)
+
+Run on the tree of the measured branch (the same branch as `files` and `loc`). Each lists up to five example paths and the
+total in `found`. A tree read that times out or fails is a `tree_scan` WARN (not verified); it never hides the other checks.
+
+| Check | Set when |
+|---|---|
+| `tree_zero_byte` | files of 0 bytes, except `.gitkeep`, `.keep`, `.gitignore`, `.nojekyll`, `__init__.py`, `py.typed`, `.npmignore`, `.gitattributes`, `.dockerignore` |
+| `tree_mode` | a file mode other than 100644, 100755, 120000 (symlink) or 160000 (submodule) |
+| `tree_symlink` | a symlink whose target is absolute or climbs out of the repository with `..` |
+| `submodule` | a submodule link (gitlink) with no `.gitmodules` entry saying where it points; separately, a note that mapped submodules' content is another repository and is not in the archive |
+| `external_pointers` | DVC pointer files (`*.dvc`) or git-annex links: the content is stored outside git |
+| `committed_junk` | committed `.DS_Store`, `Thumbs.db`, `desktop.ini`, or files under `__MACOSX`, `node_modules`, `bower_components`, `__pycache__` |
