@@ -370,3 +370,10 @@ total in `found`. A tree read that times out or fails is a `tree_scan` WARN (not
 | `submodule` | a submodule link (gitlink) with no `.gitmodules` entry saying where it points; separately, a note that mapped submodules' content is another repository and is not in the archive |
 | `external_pointers` | DVC pointer files (`*.dvc`) or git-annex links: the content is stored outside git |
 | `committed_junk` | committed `.DS_Store`, `Thumbs.db`, `desktop.ini`, or files under `__MACOSX`, `node_modules`, `bower_components`, `__pycache__` |
+
+## Squashed PRs (`squashed_prs`, WARN, GitHub layout)
+
+Merged PR records (non-empty `merged_at`) whose number appears in no `Merge pull request #N` commit and no commit subject
+ending in `(#N)`. Squash or rebase merges with rewritten messages, or history rebuilt after the PRs, leave PRs like that: the
+metadata proves they merged but git cannot show what they changed. `expected` = merged PRs, `found` = those with a trace in
+git, `missing_items` lists the numbers. Not judged when the archive's refs could not be read.

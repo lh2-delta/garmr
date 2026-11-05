@@ -960,6 +960,23 @@ def foreign_merge(entries, pr, created_at):
     return True
 
 
+def squash_findings(label, by_num, facts):
+    """Merged PR records that left no trace in git history: no "Merge pull request #N" commit and no "(#N)" subject
+    (Squirrel L5 squashing). Squash or rebase merges with rewritten messages, or a history rebuilt after the PRs, leave PRs
+    like that; the PR is real (the metadata says it merged) but git cannot show what it changed. A WARN, with the count."""
+    merged = sorted(n for n, p in by_num.items() if n is not None and str_of(p.get("merged_at")).strip())
+    if not merged or not facts.get("refs_known"):
+        return []
+    traced = facts["merge_prs"] | facts["squash_prs"]
+    lost = [n for n in merged if n not in traced]
+    if not lost:
+        return []
+    return [finding("WARN", "squashed_prs", f"{label}: {len(lost)} of {len(merged)} merged PR(s) left no merge commit or "
+                    f"(#N) commit subject in git history, so they were squashed, rebased or rewritten: "
+                    f"#{lost[:10]}{'...' if len(lost) > 10 else ''}", expected=len(merged), found=len(merged) - len(lost),
+                    missing=capped([f"#{n}" for n in lost]))]
+
+
 def created_vs_first_commit(label, created_at, first_ts):
     """History older than the repo itself means the repo was created after its commits existed (import / recreation)."""
     if imported_history(created_at, first_ts):
@@ -1964,6 +1981,7 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
     if sq:
         f.append(finding("WARN", "pr_state", f"{label}: squash-style commit refers to PR(s) {sq[:10]} that the "
                          f"metadata shows unmerged"))
+    f += squash_findings(label, by_num, facts)
     rel = [x for x in of_repo("releases") if not x.get("draft")]
     no_tag = sorted({x.get("tag_name") for x in rel if x.get("tag_name") and x.get("tag_name") not in facts["tags"]})
     if no_tag:
