@@ -839,6 +839,33 @@ def tree_findings(bare: Path, ref: str, label: str):
     return out
 
 
+MAX_FINGERPRINT_COMMITS = 500_000
+
+
+def fingerprint(bare: Path, ref: str):
+    """What garmr.duplicates compares across the run: the tree id at `ref`, the blob ids of its non-common files of at
+    least MIN_BLOB bytes, how many files were left out as common, and every commit id (bounded)."""
+    from garmr import duplicates
+    r = git(bare, "rev-parse", "--verify", "-q", f"{ref}^{{tree}}")
+    blobs, left_out = set(), 0
+    for ln in git_lines(bare, "ls-tree", "-r", "-l", "--full-tree", ref):
+        meta, _, path = ln.rstrip("\n").partition("\t")
+        parts = meta.split()
+        if len(parts) != 4 or parts[1] != "blob" or not parts[3].isdigit() or int(parts[3]) < duplicates.MIN_BLOB:
+            continue
+        if duplicates.common(path):
+            left_out += 1
+        else:
+            blobs.add(parts[2])
+    commits = set()
+    for ln in git_lines(bare, "rev-list", "--all"):
+        if len(commits) >= MAX_FINGERPRINT_COMMITS:
+            break
+        commits.add(ln.strip())
+    return {"tree": r.stdout.strip() if r.returncode == 0 else None, "blobs": blobs, "commits": commits,
+            "common": left_out}
+
+
 def latest_branch(bare: Path, default_branch=None):
     """The branch (refs/heads/*) whose tip commit is newest, the same rule the profiler uses: a tie goes to the default branch,
     then to the first name in order. '' when there is no branch, or when GARMR_USE_DEFAULT_BRANCH=1 asks for the old behaviour:
@@ -1123,6 +1150,7 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
         metrics["files"] = sum(1 for _ in git_lines(bare, "ls-tree", "-r", "--name-only", ref))
         try:
             f += tree_findings(bare, ref, label)
+            metrics["fingerprint"] = fingerprint(bare, ref)
         except CmdTimeout as e:
             f.append(finding("WARN", "tree_scan", f"{label}: tree checks not completed, {e.what} timed out after "
                              f"{e.seconds:g}s (not verified)", item="timeout"))
@@ -2434,6 +2462,15 @@ def github_live(token, api_base="https://api.github.com"):
     return live
 
 
+def _without_fingerprints(o):
+    """The report minus the duplicate-check fingerprints (sets of every blob and commit id: internal, and not JSON)."""
+    if isinstance(o, dict):
+        return {k: _without_fingerprints(v) for k, v in o.items() if k != "fingerprint"}
+    if isinstance(o, list):
+        return [_without_fingerprints(v) for v in o]
+    return o
+
+
 def print_report(rep):
     for u in rep["units"]:
         print(f"\n[{u['verdict']}] {u['name']}  ({u['layout']})")
@@ -2474,7 +2511,7 @@ def main(argv=None):
     for r in reports:
         print_report(r)
     if a.json:
-        Path(a.json).write_text(json.dumps(reports[0] if len(reports) == 1 else reports, indent=2))
+        Path(a.json).write_text(json.dumps(_without_fingerprints(reports[0] if len(reports) == 1 else reports), indent=2))
     bad = any(r["verdict"] != "COMPLETE" for r in reports)
     if a.strict:
         bad = bad or any(x["level"] == "WARN" for r in reports for x in r["findings"])

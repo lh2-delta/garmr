@@ -79,7 +79,7 @@ All files are created mode `0600` (owner only), since they list repo names and w
 
 | File | Contents |
 |---|---|
-| `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `gaps` (information only, see "Gaps column" below), `excess` (information only, same section), `for_check` (`yes` / `no` / `unreadable` / `empty`), counts found in the archive, the org's numbers, `flags`. `visibility`: `public` / `private` / `internal` / `unknown`, read from the repository record (GitHub `private`, GitLab `visibility` / `visibility_level` 20 / 10 / 0, Bitbucket `is_private`); `unknown` when the record lacks it, is unreadable or the layout is plain git, never guessed. `prs_merged` / `prs_unmerged`: counts of distinct PR (GitHub) / MR (GitLab) records in the metadata. merged = non-empty `merged_at` (or state `merged`); unmerged = every other record, closed without a merge and still open alike (one combined count, no separate "open"). `state` is only the fallback (GitHub export records carry none). A number with several records counts once, as merged if any of them is. The two are blank (not 0) when the export carries no PR/MR records, the layout has none (plain git), or a record has none of `merged_at` / `closed_at` / `state`. `prs_git` and `prs_meta` are unchanged. `extra_metrics` (what the archive holds more of than the reference, e.g. `prs_git:+3;commits:+12`) and `history_tags` (`imported`, `forked`, `suspected_forged`, `flattened`, `rewritten`, `faulty`) are described under "Org metrics CSV" below |
+| `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `gaps` (information only, see "Gaps column" below), `excess` (information only, same section), `for_check` (`yes` / `no` / `unreadable` / `empty`), counts found in the archive, the org's numbers, `flags`. `visibility`: `public` / `private` / `internal` / `unknown`, read from the repository record (GitHub `private`, GitLab `visibility` / `visibility_level` 20 / 10 / 0, Bitbucket `is_private`); `unknown` when the record lacks it, is unreadable or the layout is plain git, never guessed. `prs_merged` / `prs_unmerged`: counts of distinct PR (GitHub) / MR (GitLab) records in the metadata. merged = non-empty `merged_at` (or state `merged`); unmerged = every other record, closed without a merge and still open alike (one combined count, no separate "open"). `state` is only the fallback (GitHub export records carry none). A number with several records counts once, as merged if any of them is. The two are blank (not 0) when the export carries no PR/MR records, the layout has none (plain git), or a record has none of `merged_at` / `closed_at` / `state`. `prs_git` and `prs_meta` are unchanged. `extra_metrics` (what the archive holds more of than the reference, e.g. `prs_git:+3;commits:+12`) and `history_tags` (`imported`, `forked`, `suspected_forged`, `flattened`, `rewritten`, `faulty`) are described under "Org metrics CSV" below. `duplicates` (after `history_tags`) compares the repo with the other repos of the run; see "Duplicates among the run's repositories" |
 | `missing_items.csv` | only errors: one row per failed check with `expected`, `found`, `missing_count`, `missing_items` (e.g. PR numbers in git but with no metadata record). `missing_items` lists at most 200 examples; `missing_count` is always the real total |
 | `run_notes.txt` | non-fatal notices: CSVs skipped or unused, `.xlsx` files not read, archives that were not checked |
 
@@ -378,3 +378,31 @@ Merged PR records (non-empty `merged_at`) whose number appears in no `Merge pull
 ending in `(#N)`. Squash or rebase merges with rewritten messages, or history rebuilt after the PRs, leave PRs like that: the
 metadata proves they merged but git cannot show what they changed. `expected` = merged PRs, `found` = those with a trace in
 git, `missing_items` lists the numbers. Not judged when the archive's refs could not be read.
+
+## Duplicates among the run's repositories (`duplicate_repo`, WARN; `duplicates` column)
+
+Every repository is fingerprinted while it is checked: the tree id of the measured branch, the blob ids of its files of at
+least 64 bytes that are not common shared files, and its commit ids (up to 500,000). After the last archive the
+fingerprints are compared with each other (`garmr/duplicates.py`); it needs at least two repositories in the run.
+
+| `duplicate_repo` item | Set when |
+|---|---|
+| `identical` | the tree (every path, mode and file content) is the same as another repository's |
+| `near` | Jaccard similarity of the blob sets with the nearest repository is at least 0.8 (and the trees are not identical) |
+| `history` | at least 80% of this repository's commits also exist in one other repository (a fork or a re-upload) |
+
+The `duplicates` column (`;`-separated, information only) holds `identical:<repos>`, `nearest:<repo>=<similarity>`,
+`shared_history:<repo>=<percent>` and `shared_files=<n>/<total>` (how many of this repository's counted files also exist,
+byte for byte, in any other repository of the run). Blank for a single-repository run or a repository whose tree could not be
+read.
+
+Common files are left out of the blob set, because unrelated codebases built on the same template or libraries share them
+(case-insensitive): folders `vendor`, `vendors`, `node_modules`, `bower_components`, `jspm_packages`, `third_party`,
+`third-party`, `thirdparty`, `libs`, `dist`, `build`, `out`, `.next`, `.nuxt`, `target`, `Pods`, `Carthage`, `.gradle`,
+`.idea`, `.vscode`, `.github`, `.gitlab`, `.circleci`, `__pycache__`, `site-packages`, `.venv`, `venv`, `.dart_tool`,
+`coverage`, `.cache`, `.sass-cache`, and `storage/framework`, `bootstrap/cache`, `public/assets/plugins`, `assets/plugins`,
+`public/plugins`; lock files; git, editor and CI dotfiles; `LICENSE*` / `LICENCE*` / `COPYING*`; minified files, bundles and
+source maps; images, fonts, media, archives and binaries; stock framework files (`artisan`, `server.php`,
+`public/index.php`, `public/.htaccess`, `public/robots.txt`, `public/web.config`, `bin/rails`, `bin/rake`, `bin/setup`,
+`config.ru`, `manage.py`, `next-env.d.ts`). The exact list is in `garmr/duplicates.py`. The tree id for `identical` still
+covers every file.

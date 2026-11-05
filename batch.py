@@ -43,7 +43,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 import check_export as ce
-from garmr import forcheck
+from garmr import duplicates, forcheck
 
 INPUT_DIR = "/data/input"
 OUTPUT_DIR = "/data/output"
@@ -58,7 +58,7 @@ BRANCH_DIFF_PCT = 25
 
 REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "gaps", "excess", "for_check",
                "commits_head",
-               "commits_all", "measured_branch", "measured_by", "commits_measured", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "visibility", "extra_metrics", "history_tags", "labels", "issues",
+               "commits_all", "measured_branch", "measured_by", "commits_measured", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "visibility", "extra_metrics", "history_tags", "duplicates", "labels", "issues",
                "branches", "tags", "files", "loc",
                "org_csv_row", "org_commits", "org_loc", "org_prs", "org_branches", "org_tags", "org_files", "flags"]
 MISSING_COLS = ["repo", "provider", "archive", "check", "item", "expected", "found", "missing_count",
@@ -798,6 +798,27 @@ def unmatched_org_rows(org, matched):
     return report, missing
 
 
+def apply_duplicates(pairs):
+    """Compare every checked repository's fingerprint with the others of this run (garmr.duplicates) and add the WARNs
+    and the `duplicates` column to their report rows. Needs at least two repositories; a label seen twice (two archives
+    of one repo) is compared under `label (archive)` so neither hides the other."""
+    if len(pairs) < 2:
+        return
+    keyed, seen = {}, {}
+    for row, fp in pairs:
+        key = row["repo"] if row["repo"] not in seen else f"{row['repo']} ({row['archive']})"
+        seen[row["repo"]] = True
+        keyed[key] = (row, fp)
+    results = duplicates.compare({k: fp for k, (_, fp) in keyed.items()})
+    for key, (row, _) in keyed.items():
+        found, col = duplicates.findings_and_column(key, results[key], ce.finding)
+        row["duplicates"] = col
+        if found:
+            row["warnings"] = int(row.get("warnings") or 0) + len(found)
+            checks = set(filter(None, (row.get("warned_checks") or "").split(";"))) | {x["check"] for x in found}
+            row["warned_checks"] = ";".join(sorted(checks))
+
+
 def build_rows(rec, st):
     """-> (report_rows, missing_rows) for one analysed repo record, in input order."""
     if rec.get("orphan_fc"):          # a for-check inside a zip whose tarball is not in that zip
@@ -924,6 +945,7 @@ def _run(input_dir, output_dir, work_dir, live=None, want_loc=True, tolerance_pc
               "require_fc": os.environ.get("GARMR_REQUIRE_FOR_CHECK", "").strip().lower() in ("1", "true", "yes")}
         ctx = {"work": work_dir, "live": live, "want_loc": want_loc, "notes": notes}
         used: set = set()
+        fingerprints: list = []           # (report row, fingerprint) for the run-set duplicate comparison
         seen_archives, no_fc = set(), set()
         done = 0
         for n, arch in enumerate(archives, 1):
@@ -950,6 +972,9 @@ def _run(input_dir, output_dir, work_dir, live=None, want_loc=True, tolerance_pc
                 r, m = build_rows(rec, st)
                 rows += r
                 miss += m
+                fp = (rec.get("metrics") or {}).get("fingerprint")
+                if fp and len(r) == 1:
+                    fingerprints.append((r[0], fp))
                 if not rec.get("orphan_fc"):
                     seen_archives.add(rec["archive"])
                     if rec["for_check"] == "no":
@@ -971,6 +996,7 @@ def _run(input_dir, output_dir, work_dir, live=None, want_loc=True, tolerance_pc
             res["interrupted"] = _STOP["sig"]
             sink.abandon()
             return res
+        apply_duplicates(fingerprints)
         extra_r, extra_m = [], []
         for fc in fcs:
             if id(fc) not in used:
