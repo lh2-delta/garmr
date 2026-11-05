@@ -135,6 +135,7 @@ the `flags` column are notices, not failures:
 | `LOC_BRANCH_DIFF` | `loc` differs, possibly because CSV and archive use different branches |
 | `NOT_IN_ORG_CSV` | archive's repo has no org-CSV row |
 | `AMBIGUOUS_ORG_ROW` | more than one org-CSV row could match; not guessed, so no org number is compared for this repo |
+| `ORG_ROW_ERROR` | an org-CSV row for the repo has a filled `error` column (the profiler failed on it part-way, e.g. a UTF-8 decode error); that row's numbers are leftover defaults (often 0) and are not compared. Another row for the same repo without an error is still used |
 | `LOC_UNMEASURED` | the org CSV has a `loc` but Garmr could not measure the archive's lines of code (see the `loc_unmeasured` WARN); not compared |
 | `ORG_UNCOMPARED:<metric>` | the org CSV has this metric but the archive's value is unknown (e.g. `prs` for a plain git repo): not compared |
 

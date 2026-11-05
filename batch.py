@@ -295,7 +295,8 @@ def read_org_file(p: Path):
         if not metrics:
             return f"no metric column (commits/loc/prs/branches/tags/files) in header {list(heads)[:8]}"
         owner = next((heads[a] for a in OWNER_ALIASES if a in heads), None)
-        return {"id": idc, "owner": owner, "metrics": metrics, "rows": list(rdr), "enc": enc}
+        err = heads.get("error")
+        return {"id": idc, "owner": owner, "metrics": metrics, "rows": list(rdr), "enc": enc, "error": err}
     except (OSError, UnicodeError, csv.Error) as e:
         return f"unreadable: {type(e).__name__}: {e}"
 
@@ -343,10 +344,14 @@ def load_org(input_dir: Path, skip, notes):
             label = raw if "/" in raw or not raw_owner else f"{raw_owner}/{raw}"
             g = groups.setdefault((owner, name), {"owner": owner, "name": name, "label": label, "rows": 0,
                                                   "vals": {m: None for m in ORG_METRICS}, "bad": set(),
-                                                  "files": []})
+                                                  "files": [], "errored": 0})
             g["rows"] += 1
             if rel not in g["files"]:
                 g["files"].append(rel)
+            if res["error"] and (row.get(res["error"]) or "").strip():
+                # the profiler failed on this repo part-way: its numbers are leftover defaults, not measurements
+                g["errored"] += 1
+                continue
             for m, col in res["metrics"].items():
                 v, state = parse_org_value(row.get(col))
                 if state == "bad":
@@ -781,7 +786,8 @@ def unmatched_org_rows(org, matched):
     for e in org["entries"]:
         if id(e) in matched:
             continue
-        flags = (["MULTI_ROW"] if e["rows"] > 1 else []) + [f"ORG_VALUE_UNPARSEABLE:{m}" for m in sorted(e["bad"])]
+        flags = (["MULTI_ROW"] if e["rows"] > 1 else []) + [f"ORG_VALUE_UNPARSEABLE:{m}" for m in sorted(e["bad"])] \
+            + (["ORG_ROW_ERROR"] if e.get("errored") else [])
         report.append({c: "" for c in REPORT_COLS} | {
             "repo": e["label"], "provider": "unknown", "archive": "", "status": "NO_ARCHIVE", "errors": 1,
             "warnings": 0, "failed_checks": "archive_missing", "org_csv_row": "yes", "flags": ";".join(flags),
@@ -812,6 +818,8 @@ def build_rows(rec, st):
             row_state = "yes"
             e = hits[0]
             st["matched"] |= {id(h) for h in hits}
+            if any(h.get("errored") for h in hits):
+                flags.append("ORG_ROW_ERROR")
             if len(hits) > 1:
                 # several candidate rows: which one is this repo is a guess, so nothing is compared
                 flags.append("AMBIGUOUS_ORG_ROW")
