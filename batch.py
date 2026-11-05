@@ -43,7 +43,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 import check_export as ce
-from garmr import forcheck
+from garmr import duplicates, forcheck
 
 INPUT_DIR = "/data/input"
 OUTPUT_DIR = "/data/output"
@@ -58,7 +58,7 @@ BRANCH_DIFF_PCT = 25
 
 REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "gaps", "excess", "for_check",
                "commits_head",
-               "commits_all", "measured_branch", "measured_by", "commits_measured", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "visibility", "extra_metrics", "history_tags", "labels", "issues",
+               "commits_all", "measured_branch", "measured_by", "commits_measured", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "visibility", "extra_metrics", "history_tags", "duplicates", "labels", "issues",
                "branches", "tags", "files", "loc",
                "org_csv_row", "org_commits", "org_loc", "org_prs", "org_branches", "org_tags", "org_files", "flags"]
 MISSING_COLS = ["repo", "provider", "archive", "check", "item", "expected", "found", "missing_count",
@@ -295,7 +295,8 @@ def read_org_file(p: Path):
         if not metrics:
             return f"no metric column (commits/loc/prs/branches/tags/files) in header {list(heads)[:8]}"
         owner = next((heads[a] for a in OWNER_ALIASES if a in heads), None)
-        return {"id": idc, "owner": owner, "metrics": metrics, "rows": list(rdr), "enc": enc}
+        err = heads.get("error")
+        return {"id": idc, "owner": owner, "metrics": metrics, "rows": list(rdr), "enc": enc, "error": err}
     except (OSError, UnicodeError, csv.Error) as e:
         return f"unreadable: {type(e).__name__}: {e}"
 
@@ -343,10 +344,14 @@ def load_org(input_dir: Path, skip, notes):
             label = raw if "/" in raw or not raw_owner else f"{raw_owner}/{raw}"
             g = groups.setdefault((owner, name), {"owner": owner, "name": name, "label": label, "rows": 0,
                                                   "vals": {m: None for m in ORG_METRICS}, "bad": set(),
-                                                  "files": []})
+                                                  "files": [], "errored": 0})
             g["rows"] += 1
             if rel not in g["files"]:
                 g["files"].append(rel)
+            if res["error"] and (row.get(res["error"]) or "").strip():
+                # the profiler failed on this repo part-way: its numbers are leftover defaults, not measurements
+                g["errored"] += 1
+                continue
             for m, col in res["metrics"].items():
                 v, state = parse_org_value(row.get(col))
                 if state == "bad":
@@ -781,7 +786,8 @@ def unmatched_org_rows(org, matched):
     for e in org["entries"]:
         if id(e) in matched:
             continue
-        flags = (["MULTI_ROW"] if e["rows"] > 1 else []) + [f"ORG_VALUE_UNPARSEABLE:{m}" for m in sorted(e["bad"])]
+        flags = (["MULTI_ROW"] if e["rows"] > 1 else []) + [f"ORG_VALUE_UNPARSEABLE:{m}" for m in sorted(e["bad"])] \
+            + (["ORG_ROW_ERROR"] if e.get("errored") else [])
         report.append({c: "" for c in REPORT_COLS} | {
             "repo": e["label"], "provider": "unknown", "archive": "", "status": "NO_ARCHIVE", "errors": 1,
             "warnings": 0, "failed_checks": "archive_missing", "org_csv_row": "yes", "flags": ";".join(flags),
@@ -790,6 +796,27 @@ def unmatched_org_rows(org, matched):
                         "item": "archive", "expected": 1, "found": 0, "missing_count": 1, "missing_items": e["label"],
                         "detail": f"listed in {', '.join(e['files'])} but no archive found in input folder"})
     return report, missing
+
+
+def apply_duplicates(pairs):
+    """Compare every checked repository's fingerprint with the others of this run (garmr.duplicates) and add the WARNs
+    and the `duplicates` column to their report rows. Needs at least two repositories; a label seen twice (two archives
+    of one repo) is compared under `label (archive)` so neither hides the other."""
+    if len(pairs) < 2:
+        return
+    keyed, seen = {}, {}
+    for row, fp in pairs:
+        key = row["repo"] if row["repo"] not in seen else f"{row['repo']} ({row['archive']})"
+        seen[row["repo"]] = True
+        keyed[key] = (row, fp)
+    results = duplicates.compare({k: fp for k, (_, fp) in keyed.items()})
+    for key, (row, _) in keyed.items():
+        found, col = duplicates.findings_and_column(key, results[key], ce.finding)
+        row["duplicates"] = col
+        if found:
+            row["warnings"] = int(row.get("warnings") or 0) + len(found)
+            checks = set(filter(None, (row.get("warned_checks") or "").split(";"))) | {x["check"] for x in found}
+            row["warned_checks"] = ";".join(sorted(checks))
 
 
 def build_rows(rec, st):
@@ -812,6 +839,8 @@ def build_rows(rec, st):
             row_state = "yes"
             e = hits[0]
             st["matched"] |= {id(h) for h in hits}
+            if any(h.get("errored") for h in hits):
+                flags.append("ORG_ROW_ERROR")
             if len(hits) > 1:
                 # several candidate rows: which one is this repo is a guess, so nothing is compared
                 flags.append("AMBIGUOUS_ORG_ROW")
@@ -916,6 +945,7 @@ def _run(input_dir, output_dir, work_dir, live=None, want_loc=True, tolerance_pc
               "require_fc": os.environ.get("GARMR_REQUIRE_FOR_CHECK", "").strip().lower() in ("1", "true", "yes")}
         ctx = {"work": work_dir, "live": live, "want_loc": want_loc, "notes": notes}
         used: set = set()
+        fingerprints: list = []           # (report row, fingerprint) for the run-set duplicate comparison
         seen_archives, no_fc = set(), set()
         done = 0
         for n, arch in enumerate(archives, 1):
@@ -942,6 +972,9 @@ def _run(input_dir, output_dir, work_dir, live=None, want_loc=True, tolerance_pc
                 r, m = build_rows(rec, st)
                 rows += r
                 miss += m
+                fp = (rec.get("metrics") or {}).get("fingerprint")
+                if fp and len(r) == 1:
+                    fingerprints.append((r[0], fp))
                 if not rec.get("orphan_fc"):
                     seen_archives.add(rec["archive"])
                     if rec["for_check"] == "no":
@@ -963,6 +996,7 @@ def _run(input_dir, output_dir, work_dir, live=None, want_loc=True, tolerance_pc
             res["interrupted"] = _STOP["sig"]
             sink.abandon()
             return res
+        apply_duplicates(fingerprints)
         extra_r, extra_m = [], []
         for fc in fcs:
             if id(fc) not in used:

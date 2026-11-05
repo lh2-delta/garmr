@@ -594,6 +594,8 @@ SINGLE_COMMITTER_MIN_COMMITS = 50
 SINGLE_COMMITTER_MIN_AUTHORS = 3
 SQUASH_MIN_FILES = 20            # one commit holding at least this many files looks like a flattened history
 MAX_HISTORY_COMMITS = 500_000    # bound on memory; the scan says so when it stopped early
+GIT_EPOCH = 1112832000           # 2005-04-07, git's first release: no real git commit is older
+PLACEHOLDER_NAMES = {"", "unknown", "root", "admin", "user", "none", "(none)", "nobody", "localhost"}
 REFLOG_REWRITE = re.compile(r"\((?:amend|forced)[^)]*\)|rebase|forced-update|filter-(?:branch|repo)|reset: moving", re.I)
 MAX_REFLOG_FILES, MAX_REFLOG_BYTES = 200, 2_000_000
 
@@ -623,6 +625,16 @@ def _reflog_rewrites(gitdir: Path):
     return hits
 
 
+def placeholder_identity(ident: str) -> bool:
+    """'name <email>' that names nobody: a blank or generic name, or an e-mail that is blank, has no '@' or is a local
+    account (root@localhost). Such commits cannot be attributed to a person."""
+    name, _, email = ident.partition(" <")
+    email = email.rstrip(">").strip().lower()
+    local, at, host = email.partition("@")
+    return (name.strip().lower() in PLACEHOLDER_NAMES or not at or not local or not host
+            or local in PLACEHOLDER_NAMES or host in ("localhost", "localhost.localdomain", "(none)"))
+
+
 def history_scan(bare: Path, label: str):
     """(findings, first_commit_ts) for signs of forged, rewritten or recreated history. Needs fsck to have passed."""
     out: list = []
@@ -630,8 +642,8 @@ def history_scan(bare: Path, label: str):
     commits = {}                      # sha -> (parents, committer ts)
     authors, committers = set(), set()
     ctimes: dict = {}
-    future = reversed_dates = 0
-    ex_future = ex_rev = ex_child = None
+    future = reversed_dates = pre_git = placeholder = 0
+    ex_future = ex_rev = ex_child = ex_pre = ex_ph = None
     child_older = 0
     truncated = False
     fmt = "%H%x1f%P%x1f%an <%ae>%x1f%cn <%ce>%x1f%at%x1f%ct"
@@ -657,6 +669,12 @@ def history_scan(bare: Path, label: str):
         if at > ct + SKEW_S:
             reversed_dates += 1
             ex_rev = ex_rev or sha
+        if at < GIT_EPOCH or ct < GIT_EPOCH:
+            pre_git += 1
+            ex_pre = ex_pre or sha
+        if placeholder_identity(an):
+            placeholder += 1
+            ex_ph = ex_ph or sha
     if not commits:
         return out, None
     n = len(commits)
@@ -668,6 +686,12 @@ def history_scan(bare: Path, label: str):
     if reversed_dates:
         out.append(_hw(label, f"{reversed_dates} commit(s) whose author date is later than committer date "
                        f"(e.g. {ex_rev[:12]})", found=reversed_dates, item="author_after_committer"))
+    if pre_git:
+        out.append(_hw(label, f"{pre_git} commit(s) dated before git existed (2005-04-07), e.g. {ex_pre[:12]}; "
+                       "the dates were set by hand or by a converter", found=pre_git, expected=n, item="pre_git_date"))
+    if placeholder:
+        out.append(_hw(label, f"{placeholder} of {n} commit(s) carry a placeholder author identity (blank, unknown, root or "
+                       f"no usable e-mail), e.g. {ex_ph[:12]}", found=placeholder, expected=n, item="placeholder_identity"))
     for sha, (parents, ct) in commits.items():
         for p in parents:
             pc = commits.get(p)
@@ -718,6 +742,128 @@ def history_scan(bare: Path, label: str):
         out.append(_hw(label, f"{bad} commit(s) carry a signature that does not match the commit (BAD signature)",
                        found=bad, item="bad_signature"))
     return out, first_ts
+
+
+# ---------------------------------------------------------------- the measured branch's tree
+TREE_ZERO_BYTE_ALLOW = {".gitkeep", ".keep", ".gitignore", ".nojekyll", "__init__.py", "py.typed", ".npmignore",
+                        ".gitattributes", ".dockerignore"}
+TREE_MODES = {"100644", "100755", "120000", "160000"}
+JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
+JUNK_DIRS = {"__macosx", "node_modules", "bower_components", "__pycache__"}
+MAX_SYMLINKS_READ = 2000
+
+
+def _examples(paths, n=5):
+    return ", ".join(paths[:n]) + (f" (+{len(paths) - n} more)" if len(paths) > n else "")
+
+
+def _gitmodules_paths(bare: Path, ref):
+    r = git(bare, "config", "--blob", f"{ref}:.gitmodules", "--get-regexp", r"^submodule\..*\.path$")
+    return {ln.split(" ", 1)[1].strip() for ln in r.stdout.splitlines() if " " in ln} if r.returncode == 0 else set()
+
+
+def tree_findings(bare: Path, ref: str, label: str):
+    """WARNs about what the tree at `ref` holds (Squirrel L2/L9/L10.4): 0-byte files outside the allowlist, file modes git
+    does not produce, symlinks that point outside the repository, submodules (gitlinks) that .gitmodules does not map, DVC /
+    git-annex pointers whose content lives elsewhere, and committed operating-system or dependency folders."""
+    zero, odd_modes, links, gitlinks, dvc, annex, junk = [], [], [], [], [], [], {}
+    for ln in git_lines(bare, "ls-tree", "-r", "-l", "--full-tree", ref):
+        meta, _, path = ln.rstrip("\n").partition("\t")
+        parts = meta.split()
+        if len(parts) != 4 or not path:
+            continue
+        mode, _kind, sha, size = parts
+        name = path.rsplit("/", 1)[-1]
+        if mode not in TREE_MODES:
+            odd_modes.append(f"{path} ({mode})")
+        if mode == "160000":
+            gitlinks.append(path)
+        elif mode == "120000":
+            links.append((path, sha))
+        elif size == "0" and name not in TREE_ZERO_BYTE_ALLOW:
+            zero.append(path)
+        if name.endswith(".dvc"):
+            dvc.append(path)
+        low = path.lower().split("/")
+        if low[-1] in JUNK_NAMES:
+            junk.setdefault(name, []).append(path)
+        for seg in low[:-1]:
+            if seg in JUNK_DIRS:
+                junk.setdefault(seg if seg != "__macosx" else "__MACOSX", []).append(path)
+                break
+    out = []
+    if zero:
+        out.append(finding("WARN", "tree_zero_byte", f"{label}: {len(zero)} 0-byte file(s) at {ref}: {_examples(zero)}",
+                           found=len(zero)))
+    if odd_modes:
+        out.append(finding("WARN", "tree_mode", f"{label}: {len(odd_modes)} file(s) with a mode git does not write: "
+                           f"{_examples(odd_modes)}", found=len(odd_modes)))
+    bad_links = []
+    for path, sha in links[:MAX_SYMLINKS_READ]:
+        r = git(bare, "cat-file", "blob", sha)
+        target = r.stdout.strip() if r.returncode == 0 else ""
+        depth = len(path.split("/")) - 1
+        for seg in target.split("/"):
+            if seg == "..":
+                depth -= 1
+            elif seg not in ("", "."):
+                depth += 1
+            if depth < 0:
+                break
+        if "/annex/objects/" in target:
+            annex.append(path)
+        elif target.startswith("/") or depth < 0:
+            bad_links.append(f"{path} -> {target}")
+    if bad_links:
+        out.append(finding("WARN", "tree_symlink", f"{label}: {len(bad_links)} symlink(s) point outside the repository: "
+                           f"{_examples(bad_links)}", found=len(bad_links)))
+    if gitlinks:
+        mapped = _gitmodules_paths(bare, ref)
+        unmapped = [p for p in gitlinks if p not in mapped]
+        if unmapped:
+            out.append(finding("WARN", "submodule", f"{label}: {len(unmapped)} submodule link(s) with no .gitmodules entry "
+                               f"saying where they point: {_examples(unmapped)}", found=len(unmapped), expected=len(gitlinks)))
+        if len(unmapped) < len(gitlinks):
+            out.append(finding("WARN", "submodule", f"{label}: {len(gitlinks) - len(unmapped)} submodule(s); their content "
+                               "is another repository and is not in this archive", found=len(gitlinks) - len(unmapped)))
+    if dvc or annex:
+        out.append(finding("WARN", "external_pointers", f"{label}: content stored outside git: "
+                           + "; ".join(x for x in (f"{len(dvc)} DVC pointer file(s) ({_examples(dvc)})" if dvc else "",
+                                                   f"{len(annex)} git-annex link(s) ({_examples(annex)})" if annex else "")
+                                       if x), found=len(dvc) + len(annex)))
+    if junk:
+        n = sum(len(v) for v in junk.values())
+        out.append(finding("WARN", "committed_junk", f"{label}: {n} committed file(s) that belong to an operating system or "
+                           "a dependency install: " + "; ".join(f"{k} ({len(v)})" for k, v in sorted(junk.items())),
+                           found=n))
+    return out
+
+
+MAX_FINGERPRINT_COMMITS = 500_000
+
+
+def fingerprint(bare: Path, ref: str):
+    """What garmr.duplicates compares across the run: the tree id at `ref`, the blob ids of its non-common files of at
+    least MIN_BLOB bytes, how many files were left out as common, and every commit id (bounded)."""
+    from garmr import duplicates
+    r = git(bare, "rev-parse", "--verify", "-q", f"{ref}^{{tree}}")
+    blobs, left_out = set(), 0
+    for ln in git_lines(bare, "ls-tree", "-r", "-l", "--full-tree", ref):
+        meta, _, path = ln.rstrip("\n").partition("\t")
+        parts = meta.split()
+        if len(parts) != 4 or parts[1] != "blob" or not parts[3].isdigit() or int(parts[3]) < duplicates.MIN_BLOB:
+            continue
+        if duplicates.common(path):
+            left_out += 1
+        else:
+            blobs.add(parts[2])
+    commits = set()
+    for ln in git_lines(bare, "rev-list", "--all"):
+        if len(commits) >= MAX_FINGERPRINT_COMMITS:
+            break
+        commits.add(ln.strip())
+    return {"tree": r.stdout.strip() if r.returncode == 0 else None, "blobs": blobs, "commits": commits,
+            "common": left_out}
 
 
 def latest_branch(bare: Path, default_branch=None):
@@ -793,6 +939,7 @@ HISTORY_TAG_OF_SIGNAL = {
     "created_after_history": "imported",
     "future_dated": "suspected_forged", "author_after_committer": "suspected_forged", "non_monotonic": "suspected_forged",
     "bulk_timestamp": "suspected_forged", "single_committer": "suspected_forged", "bad_signature": "suspected_forged",
+    "pre_git_date": "suspected_forged",
     "multi_root": "flattened", "squashed": "flattened",
     "unreachable": "rewritten", "reflog_rewrite": "rewritten",
 }
@@ -838,6 +985,23 @@ def foreign_merge(entries, pr, created_at):
         if not (old or other):
             return False
     return True
+
+
+def squash_findings(label, by_num, facts):
+    """Merged PR records that left no trace in git history: no "Merge pull request #N" commit and no "(#N)" subject
+    (Squirrel L5 squashing). Squash or rebase merges with rewritten messages, or a history rebuilt after the PRs, leave PRs
+    like that; the PR is real (the metadata says it merged) but git cannot show what it changed. A WARN, with the count."""
+    merged = sorted(n for n, p in by_num.items() if n is not None and str_of(p.get("merged_at")).strip())
+    if not merged or not facts.get("refs_known"):
+        return []
+    traced = facts["merge_prs"] | facts["squash_prs"]
+    lost = [n for n in merged if n not in traced]
+    if not lost:
+        return []
+    return [finding("WARN", "squashed_prs", f"{label}: {len(lost)} of {len(merged)} merged PR(s) left no merge commit or "
+                    f"(#N) commit subject in git history, so they were squashed, rebased or rewritten: "
+                    f"#{lost[:10]}{'...' if len(lost) > 10 else ''}", expected=len(merged), found=len(merged) - len(lost),
+                    missing=capped([f"#{n}" for n in lost]))]
 
 
 def created_vs_first_commit(label, created_at, first_ts):
@@ -970,6 +1134,7 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
     metrics["tags"] = sum(1 for r in refs if r.startswith("refs/tags/"))
     if refs:
         metrics["commits_all"] = git_int(bare, "rev-list", "--count", "--all")
+        facts["roots"] = {ln.strip() for ln in git_lines(bare, "rev-list", "--max-parents=0", "--all") if ln.strip()}
     lfs_oids = set()
     default_ref = f"refs/heads/{default_branch}" if default_branch and f"refs/heads/{default_branch}" in refs_map else "HEAD"
     if refs and git(bare, "rev-parse", "--verify", "-q", default_ref).returncode == 0:
@@ -983,6 +1148,14 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
     if refs and git(bare, "rev-parse", "--verify", "-q", ref).returncode == 0:
         metrics["commits_measured"] = git_int(bare, "rev-list", "--count", ref)
         metrics["files"] = sum(1 for _ in git_lines(bare, "ls-tree", "-r", "--name-only", ref))
+        try:
+            f += tree_findings(bare, ref, label)
+            metrics["fingerprint"] = fingerprint(bare, ref)
+        except CmdTimeout as e:
+            f.append(finding("WARN", "tree_scan", f"{label}: tree checks not completed, {e.what} timed out after "
+                             f"{e.seconds:g}s (not verified)", item="timeout"))
+        except GitError as e:
+            f.append(finding("WARN", "tree_scan", f"{label}: tree checks not completed, {e}", item="git_error"))
         if want_loc:
             try:
                 metrics["loc"] = measure_loc(bare, ref)
@@ -1392,6 +1565,28 @@ def live_bounds(live, owner, name, label, side=None):
     return {k: (v, v) for k, v in api.items() if v is not None}, out
 
 
+def root_findings(label, recorded, facts):
+    """The source's recorded root commit id(s) against the archive's root commits (Squirrel L8). A recorded root that the
+    archive's git lacks means its history starts somewhere else: rewritten, grafted or a different repository (FAIL).
+    Roots the archive has beyond the recorded ones are a WARN (an orphan branch or a joined history)."""
+    have = facts.get("roots")
+    if not recorded or have is None:
+        return []
+    out = []
+    lost = sorted(recorded - have)
+    if lost:
+        out.append(finding("FAIL", "root_commit", f"{label}: the source recorded root commit(s) {[s[:12] for s in lost]} "
+                           f"that are not roots in the archive's git (its roots: {[s[:12] for s in sorted(have)][:5]}); "
+                           "the history starts somewhere else", expected=len(recorded), found=len(recorded) - len(lost),
+                           missing=capped(lost)))
+    extra = sorted(have - recorded)
+    if extra and not lost:
+        out.append(finding("WARN", "root_commit", f"{label}: {len(extra)} root commit(s) beyond the {len(recorded)} the "
+                           f"source recorded: {[s[:12] for s in extra][:5]}", expected=len(recorded),
+                           found=len(have), item="extra"))
+    return out
+
+
 def for_check_findings(fc, label, single, mine, facts, ref_pattern, entities, record_default_branch=None):
     """Counts (min/max of the two snapshots), refs and default branch of one repo against its for-check rows.
 
@@ -1417,6 +1612,7 @@ def for_check_findings(fc, label, single, mine, facts, ref_pattern, entities, re
             for e in entities if e in OPTIONAL_COUNTS and e in bounds and mine.get(e) is None]
     out += ref_findings(label, *fc.ref_snapshots(key), facts.get("refs_map") or {}, ref_pattern,
                         known=facts.get("refs_known"))
+    out += root_findings(label, fc.recorded_roots(key), facts)
     want = fc.source_default_branch(key)
     if want and record_default_branch and want != record_default_branch:
         out.append(finding("WARN", "default_branch", f"{label}: source default branch {want!r}, archive record says "
@@ -1837,6 +2033,7 @@ def _github_repo(S, root, r, owner, name, label, f, rec, listed):
     if sq:
         f.append(finding("WARN", "pr_state", f"{label}: squash-style commit refers to PR(s) {sq[:10]} that the "
                          f"metadata shows unmerged"))
+    f += squash_findings(label, by_num, facts)
     rel = [x for x in of_repo("releases") if not x.get("draft")]
     no_tag = sorted({x.get("tag_name") for x in rel if x.get("tag_name") and x.get("tag_name") not in facts["tags"]})
     if no_tag:
@@ -2265,6 +2462,15 @@ def github_live(token, api_base="https://api.github.com"):
     return live
 
 
+def _without_fingerprints(o):
+    """The report minus the duplicate-check fingerprints (sets of every blob and commit id: internal, and not JSON)."""
+    if isinstance(o, dict):
+        return {k: _without_fingerprints(v) for k, v in o.items() if k != "fingerprint"}
+    if isinstance(o, list):
+        return [_without_fingerprints(v) for v in o]
+    return o
+
+
 def print_report(rep):
     for u in rep["units"]:
         print(f"\n[{u['verdict']}] {u['name']}  ({u['layout']})")
@@ -2305,7 +2511,7 @@ def main(argv=None):
     for r in reports:
         print_report(r)
     if a.json:
-        Path(a.json).write_text(json.dumps(reports[0] if len(reports) == 1 else reports, indent=2))
+        Path(a.json).write_text(json.dumps(_without_fingerprints(reports[0] if len(reports) == 1 else reports), indent=2))
     bad = any(r["verdict"] != "COMPLETE" for r in reports)
     if a.strict:
         bad = bad or any(x["level"] == "WARN" for r in reports for x in r["findings"])

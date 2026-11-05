@@ -79,7 +79,7 @@ All files are created mode `0600` (owner only), since they list repo names and w
 
 | File | Contents |
 |---|---|
-| `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `gaps` (information only, see "Gaps column" below), `excess` (information only, same section), `for_check` (`yes` / `no` / `unreadable` / `empty`), counts found in the archive, the org's numbers, `flags`. `visibility`: `public` / `private` / `internal` / `unknown`, read from the repository record (GitHub `private`, GitLab `visibility` / `visibility_level` 20 / 10 / 0, Bitbucket `is_private`); `unknown` when the record lacks it, is unreadable or the layout is plain git, never guessed. `prs_merged` / `prs_unmerged`: counts of distinct PR (GitHub) / MR (GitLab) records in the metadata. merged = non-empty `merged_at` (or state `merged`); unmerged = every other record, closed without a merge and still open alike (one combined count, no separate "open"). `state` is only the fallback (GitHub export records carry none). A number with several records counts once, as merged if any of them is. The two are blank (not 0) when the export carries no PR/MR records, the layout has none (plain git), or a record has none of `merged_at` / `closed_at` / `state`. `prs_git` and `prs_meta` are unchanged. `extra_metrics` (what the archive holds more of than the reference, e.g. `prs_git:+3;commits:+12`) and `history_tags` (`imported`, `forked`, `suspected_forged`, `flattened`, `rewritten`, `faulty`) are described under "Org metrics CSV" below |
+| `completeness_report.csv` | one row per repo: `COMPLETE` / `INCOMPLETE` / `NO_ARCHIVE`, provider (auto-detected), `warned_checks` (names of the WARN checks that fired, `;`-separated, e.g. `history_forgery;lfs`; `warnings` is their count), `failed_checks`, `gaps` (information only, see "Gaps column" below), `excess` (information only, same section), `for_check` (`yes` / `no` / `unreadable` / `empty`), counts found in the archive, the org's numbers, `flags`. `visibility`: `public` / `private` / `internal` / `unknown`, read from the repository record (GitHub `private`, GitLab `visibility` / `visibility_level` 20 / 10 / 0, Bitbucket `is_private`); `unknown` when the record lacks it, is unreadable or the layout is plain git, never guessed. `prs_merged` / `prs_unmerged`: counts of distinct PR (GitHub) / MR (GitLab) records in the metadata. merged = non-empty `merged_at` (or state `merged`); unmerged = every other record, closed without a merge and still open alike (one combined count, no separate "open"). `state` is only the fallback (GitHub export records carry none). A number with several records counts once, as merged if any of them is. The two are blank (not 0) when the export carries no PR/MR records, the layout has none (plain git), or a record has none of `merged_at` / `closed_at` / `state`. `prs_git` and `prs_meta` are unchanged. `extra_metrics` (what the archive holds more of than the reference, e.g. `prs_git:+3;commits:+12`) and `history_tags` (`imported`, `forked`, `suspected_forged`, `flattened`, `rewritten`, `faulty`) are described under "Org metrics CSV" below. `duplicates` (after `history_tags`) compares the repo with the other repos of the run; see "Duplicates among the run's repositories" |
 | `missing_items.csv` | only errors: one row per failed check with `expected`, `found`, `missing_count`, `missing_items` (e.g. PR numbers in git but with no metadata record). `missing_items` lists at most 200 examples; `missing_count` is always the real total |
 | `run_notes.txt` | non-fatal notices: CSVs skipped or unused, `.xlsx` files not read, archives that were not checked |
 
@@ -111,7 +111,7 @@ recreate, so a downstream percentage tolerance must never cover it), `archive_in
 `metadata_json`, `record_incomplete`, `required_file`, `layout`, schema/format, hash/checksum, `history_forgery`,
 `repo_not_exported`, `for_check_*`, `live_check_failed`, `dangling_reference`, and the
 named-item misses with no reference total (`events_parent`, `comments_parent`, `pr_state`, `release_tag`, `default_branch`,
-`number_refs`). They say the archive is broken or unverifiable, not that a number is short, so a percentage tolerance would be
+`number_refs`, `root_commit`). They say the archive is broken or unverifiable, not that a number is short, so a percentage tolerance would be
 meaningless. Blank on `NO_ARCHIVE` rows. It is information only: Garmr stays strict and `status` / `failed_checks` ignore it.
 Squirrel reads it to apply its own 5% tolerance; the tolerance is not applied here.
 
@@ -135,6 +135,7 @@ the `flags` column are notices, not failures:
 | `LOC_BRANCH_DIFF` | `loc` differs, possibly because CSV and archive use different branches |
 | `NOT_IN_ORG_CSV` | archive's repo has no org-CSV row |
 | `AMBIGUOUS_ORG_ROW` | more than one org-CSV row could match; not guessed, so no org number is compared for this repo |
+| `ORG_ROW_ERROR` | an org-CSV row for the repo has a filled `error` column (the profiler failed on it part-way, e.g. a UTF-8 decode error); that row's numbers are leftover defaults (often 0) and are not compared. Another row for the same repo without an error is still used |
 | `LOC_UNMEASURED` | the org CSV has a `loc` but Garmr could not measure the archive's lines of code (see the `loc_unmeasured` WARN); not compared |
 | `ORG_UNCOMPARED:<metric>` | the org CSV has this metric but the archive's value is unknown (e.g. `prs` for a plain git repo): not compared |
 
@@ -221,7 +222,7 @@ person, built from signals Garmr already computes; suspected, never proof, and t
 |---|---|
 | `imported` | the first commit is older than the repository's `created_at` (`created_after_history`), or merge commits carry PR numbers that belong to the repo's earlier life (the `pr_state` imported-numbers WARN) |
 | `forked` | the repository record says it is a fork |
-| `suspected_forged` | a `history_forgery` signal: future-dated commits, author date after committer date, a child older than its parent, bulk same-second commits, one committer over many authors, a BAD signature |
+| `suspected_forged` | a `history_forgery` signal: future-dated commits, author date after committer date, a child older than its parent, bulk same-second commits, one committer over many authors, a BAD signature, commits dated before git existed |
 | `flattened` | one squashed commit, or several root commits |
 | `rewritten` | reflog rewrites or unreachable commits, or the platform recorded `base_ref_force_pushed` events |
 | `faulty` | a failed `git_integrity`, `repo_git` or `archive_integrity` check (missing or corrupt objects, shallow, no refs, truncated archive) |
@@ -265,6 +266,7 @@ New checks (all FAIL unless noted; `item` is the value in `missing_items.csv`):
 | `live_counts` / `<entity>` | the archive holds fewer than the lower bound (see below); `missing_count` is the shortfall. More than the upper bound only warns. Same check name as the live API comparison |
 | `refs` | a ref on the source both before and after the export is not in the archive's git. Same ref at another sha only warns |
 | `default_branch` / `source` (WARN) | source default branch differs from the archive's repository record |
+| `root_commit` | a root commit id the source recorded (key `root_commit`, `root_commits`, `roots`, `roots_sha`, `first_commit` or `initial_commit` in any section; several ids per value allowed) is not a root of the archive's git: the history starts somewhere else. Roots beyond the recorded ones only WARN (item `extra`). Not judged when nothing is recorded |
 | `visibility_mismatch` (WARN) | the archive record's visibility is known and a `visibility` count row of the for-check (`counts_before` / `counts_after`; value `public` / `private` / `internal`), or the GitHub API with `GITHUB_TOKEN`, states a different one; `item` names the source (`for-check` / `live API`). Informational: a missing value on either side is skipped silently |
 
 `file_listing` runs only for `.tar.gz` / `.tgz` / `.tar`, against the extraction root (a single wrapper folder is tolerated);
@@ -351,5 +353,56 @@ python3 -m pytest -q
 Heuristics, not proof; a person reads them. Thresholds are named constants in `check_export.py`.
 Future-dated commits, author date after committer date, child older than parent, bulk same-second committer time,
 one committer over many authors, multiple roots, single squashed commit, unreachable commits, reflog rewrites,
-BAD gpg signature (only when the signer's key is in the keyring; unverifiable signatures are not flagged), and
-repo `created_at` newer than the first commit. Not covered: ref/commit-count upper bounds still only WARN.
+BAD gpg signature (only when the signer's key is in the keyring; unverifiable signatures are not flagged),
+repo `created_at` newer than the first commit, commits dated before git existed (2005-04-07, item `pre_git_date`) and
+commits whose author identity is a placeholder (blank, `unknown`, `root` or similar name, or an e-mail that is blank, has no
+`@` or is a local account such as `root@localhost`; item `placeholder_identity`, with the count over all commits). Not covered: ref/commit-count upper bounds still only WARN.
+
+## Tree checks (always WARN)
+
+Run on the tree of the measured branch (the same branch as `files` and `loc`). Each lists up to five example paths and the
+total in `found`. A tree read that times out or fails is a `tree_scan` WARN (not verified); it never hides the other checks.
+
+| Check | Set when |
+|---|---|
+| `tree_zero_byte` | files of 0 bytes, except `.gitkeep`, `.keep`, `.gitignore`, `.nojekyll`, `__init__.py`, `py.typed`, `.npmignore`, `.gitattributes`, `.dockerignore` |
+| `tree_mode` | a file mode other than 100644, 100755, 120000 (symlink) or 160000 (submodule) |
+| `tree_symlink` | a symlink whose target is absolute or climbs out of the repository with `..` |
+| `submodule` | a submodule link (gitlink) with no `.gitmodules` entry saying where it points; separately, a note that mapped submodules' content is another repository and is not in the archive |
+| `external_pointers` | DVC pointer files (`*.dvc`) or git-annex links: the content is stored outside git |
+| `committed_junk` | committed `.DS_Store`, `Thumbs.db`, `desktop.ini`, or files under `__MACOSX`, `node_modules`, `bower_components`, `__pycache__` |
+
+## Squashed PRs (`squashed_prs`, WARN, GitHub layout)
+
+Merged PR records (non-empty `merged_at`) whose number appears in no `Merge pull request #N` commit and no commit subject
+ending in `(#N)`. Squash or rebase merges with rewritten messages, or history rebuilt after the PRs, leave PRs like that: the
+metadata proves they merged but git cannot show what they changed. `expected` = merged PRs, `found` = those with a trace in
+git, `missing_items` lists the numbers. Not judged when the archive's refs could not be read.
+
+## Duplicates among the run's repositories (`duplicate_repo`, WARN; `duplicates` column)
+
+Every repository is fingerprinted while it is checked: the tree id of the measured branch, the blob ids of its files of at
+least 64 bytes that are not common shared files, and its commit ids (up to 500,000). After the last archive the
+fingerprints are compared with each other (`garmr/duplicates.py`); it needs at least two repositories in the run.
+
+| `duplicate_repo` item | Set when |
+|---|---|
+| `identical` | the tree (every path, mode and file content) is the same as another repository's |
+| `near` | Jaccard similarity of the blob sets with the nearest repository is at least 0.8 (and the trees are not identical) |
+| `history` | at least 80% of this repository's commits also exist in one other repository (a fork or a re-upload) |
+
+The `duplicates` column (`;`-separated, information only) holds `identical:<repos>`, `nearest:<repo>=<similarity>`,
+`shared_history:<repo>=<percent>` and `shared_files=<n>/<total>` (how many of this repository's counted files also exist,
+byte for byte, in any other repository of the run). Blank for a single-repository run or a repository whose tree could not be
+read.
+
+Common files are left out of the blob set, because unrelated codebases built on the same template or libraries share them
+(case-insensitive): folders `vendor`, `vendors`, `node_modules`, `bower_components`, `jspm_packages`, `third_party`,
+`third-party`, `thirdparty`, `libs`, `dist`, `build`, `out`, `.next`, `.nuxt`, `target`, `Pods`, `Carthage`, `.gradle`,
+`.idea`, `.vscode`, `.github`, `.gitlab`, `.circleci`, `__pycache__`, `site-packages`, `.venv`, `venv`, `.dart_tool`,
+`coverage`, `.cache`, `.sass-cache`, and `storage/framework`, `bootstrap/cache`, `public/assets/plugins`, `assets/plugins`,
+`public/plugins`; lock files; git, editor and CI dotfiles; `LICENSE*` / `LICENCE*` / `COPYING*`; minified files, bundles and
+source maps; images, fonts, media, archives and binaries; stock framework files (`artisan`, `server.php`,
+`public/index.php`, `public/.htaccess`, `public/robots.txt`, `public/web.config`, `bin/rails`, `bin/rake`, `bin/setup`,
+`config.ru`, `manage.py`, `next-env.d.ts`). The exact list is in `garmr/duplicates.py`. The tree id for `identical` still
+covers every file.
