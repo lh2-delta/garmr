@@ -1107,6 +1107,7 @@ def _git_facts(f, bare, label, scan_lfs, want_loc, default_branch, empty_ok, slu
     metrics["tags"] = sum(1 for r in refs if r.startswith("refs/tags/"))
     if refs:
         metrics["commits_all"] = git_int(bare, "rev-list", "--count", "--all")
+        facts["roots"] = {ln.strip() for ln in git_lines(bare, "rev-list", "--max-parents=0", "--all") if ln.strip()}
     lfs_oids = set()
     default_ref = f"refs/heads/{default_branch}" if default_branch and f"refs/heads/{default_branch}" in refs_map else "HEAD"
     if refs and git(bare, "rev-parse", "--verify", "-q", default_ref).returncode == 0:
@@ -1536,6 +1537,28 @@ def live_bounds(live, owner, name, label, side=None):
     return {k: (v, v) for k, v in api.items() if v is not None}, out
 
 
+def root_findings(label, recorded, facts):
+    """The source's recorded root commit id(s) against the archive's root commits (Squirrel L8). A recorded root that the
+    archive's git lacks means its history starts somewhere else: rewritten, grafted or a different repository (FAIL).
+    Roots the archive has beyond the recorded ones are a WARN (an orphan branch or a joined history)."""
+    have = facts.get("roots")
+    if not recorded or have is None:
+        return []
+    out = []
+    lost = sorted(recorded - have)
+    if lost:
+        out.append(finding("FAIL", "root_commit", f"{label}: the source recorded root commit(s) {[s[:12] for s in lost]} "
+                           f"that are not roots in the archive's git (its roots: {[s[:12] for s in sorted(have)][:5]}); "
+                           "the history starts somewhere else", expected=len(recorded), found=len(recorded) - len(lost),
+                           missing=capped(lost)))
+    extra = sorted(have - recorded)
+    if extra and not lost:
+        out.append(finding("WARN", "root_commit", f"{label}: {len(extra)} root commit(s) beyond the {len(recorded)} the "
+                           f"source recorded: {[s[:12] for s in extra][:5]}", expected=len(recorded),
+                           found=len(have), item="extra"))
+    return out
+
+
 def for_check_findings(fc, label, single, mine, facts, ref_pattern, entities, record_default_branch=None):
     """Counts (min/max of the two snapshots), refs and default branch of one repo against its for-check rows.
 
@@ -1561,6 +1584,7 @@ def for_check_findings(fc, label, single, mine, facts, ref_pattern, entities, re
             for e in entities if e in OPTIONAL_COUNTS and e in bounds and mine.get(e) is None]
     out += ref_findings(label, *fc.ref_snapshots(key), facts.get("refs_map") or {}, ref_pattern,
                         known=facts.get("refs_known"))
+    out += root_findings(label, fc.recorded_roots(key), facts)
     want = fc.source_default_branch(key)
     if want and record_default_branch and want != record_default_branch:
         out.append(finding("WARN", "default_branch", f"{label}: source default branch {want!r}, archive record says "

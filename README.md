@@ -111,7 +111,7 @@ recreate, so a downstream percentage tolerance must never cover it), `archive_in
 `metadata_json`, `record_incomplete`, `required_file`, `layout`, schema/format, hash/checksum, `history_forgery`,
 `repo_not_exported`, `for_check_*`, `live_check_failed`, `dangling_reference`, and the
 named-item misses with no reference total (`events_parent`, `comments_parent`, `pr_state`, `release_tag`, `default_branch`,
-`number_refs`). They say the archive is broken or unverifiable, not that a number is short, so a percentage tolerance would be
+`number_refs`, `root_commit`). They say the archive is broken or unverifiable, not that a number is short, so a percentage tolerance would be
 meaningless. Blank on `NO_ARCHIVE` rows. It is information only: Garmr stays strict and `status` / `failed_checks` ignore it.
 Squirrel reads it to apply its own 5% tolerance; the tolerance is not applied here.
 
@@ -266,6 +266,7 @@ New checks (all FAIL unless noted; `item` is the value in `missing_items.csv`):
 | `live_counts` / `<entity>` | the archive holds fewer than the lower bound (see below); `missing_count` is the shortfall. More than the upper bound only warns. Same check name as the live API comparison |
 | `refs` | a ref on the source both before and after the export is not in the archive's git. Same ref at another sha only warns |
 | `default_branch` / `source` (WARN) | source default branch differs from the archive's repository record |
+| `root_commit` | a root commit id the source recorded (key `root_commit`, `root_commits`, `roots`, `roots_sha`, `first_commit` or `initial_commit` in any section; several ids per value allowed) is not a root of the archive's git: the history starts somewhere else. Roots beyond the recorded ones only WARN (item `extra`). Not judged when nothing is recorded |
 | `visibility_mismatch` (WARN) | the archive record's visibility is known and a `visibility` count row of the for-check (`counts_before` / `counts_after`; value `public` / `private` / `internal`), or the GitHub API with `GITHUB_TOKEN`, states a different one; `item` names the source (`for-check` / `live API`). Informational: a missing value on either side is skipped silently |
 
 `file_listing` runs only for `.tar.gz` / `.tgz` / `.tar`, against the extraction root (a single wrapper folder is tolerated);
