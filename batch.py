@@ -18,7 +18,9 @@ archives, output/work unwritable, not enough space, scc missing, disk full/permi
 130 SIGINT | 143 SIGTERM.
 
 Org metrics CSV rule: org number > what the archive holds  -> error row in missing_items.csv (repo INCOMPLETE)
-                      org number < what the archive holds  -> only flagged (ORG_LOWER:<metric>) in the report
+                      org number < what the archive holds  -> an "Extra <metric> detected" WARN (check extra_metrics), the
+                                                              `extra_metrics` column, and the old ORG_LOWER:<metric> flag
+                      PRs: the number is looked for in git history and in the metadata separately (see compare_prs)
 """
 from __future__ import annotations
 
@@ -41,7 +43,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 import check_export as ce
-from garmr import forcheck
+from garmr import duplicates, forcheck
 
 INPUT_DIR = "/data/input"
 OUTPUT_DIR = "/data/output"
@@ -54,9 +56,10 @@ SPACE_FACTOR = 3.2
 MAX_ZIP_DEPTH = 2
 BRANCH_DIFF_PCT = 25
 
-REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "for_check",
+REPORT_COLS = ["repo", "provider", "archive", "status", "errors", "warnings", "warned_checks", "failed_checks", "gaps", "excess", "for_check",
                "commits_head",
-               "commits_all", "prs_git", "prs_meta", "labels", "issues", "branches", "tags", "files", "loc",
+               "commits_all", "measured_branch", "measured_by", "commits_measured", "prs_git", "prs_meta", "prs_merged", "prs_unmerged", "visibility", "extra_metrics", "history_tags", "duplicates", "labels", "issues",
+               "branches", "tags", "files", "loc",
                "org_csv_row", "org_commits", "org_loc", "org_prs", "org_branches", "org_tags", "org_files", "flags"]
 MISSING_COLS = ["repo", "provider", "archive", "check", "item", "expected", "found", "missing_count",
                 "missing_items", "detail"]
@@ -292,7 +295,8 @@ def read_org_file(p: Path):
         if not metrics:
             return f"no metric column (commits/loc/prs/branches/tags/files) in header {list(heads)[:8]}"
         owner = next((heads[a] for a in OWNER_ALIASES if a in heads), None)
-        return {"id": idc, "owner": owner, "metrics": metrics, "rows": list(rdr), "enc": enc}
+        err = heads.get("error")
+        return {"id": idc, "owner": owner, "metrics": metrics, "rows": list(rdr), "enc": enc, "error": err}
     except (OSError, UnicodeError, csv.Error) as e:
         return f"unreadable: {type(e).__name__}: {e}"
 
@@ -340,10 +344,14 @@ def load_org(input_dir: Path, skip, notes):
             label = raw if "/" in raw or not raw_owner else f"{raw_owner}/{raw}"
             g = groups.setdefault((owner, name), {"owner": owner, "name": name, "label": label, "rows": 0,
                                                   "vals": {m: None for m in ORG_METRICS}, "bad": set(),
-                                                  "files": []})
+                                                  "files": [], "errored": 0})
             g["rows"] += 1
             if rel not in g["files"]:
                 g["files"].append(rel)
+            if res["error"] and (row.get(res["error"]) or "").strip():
+                # the profiler failed on this repo part-way: its numbers are leftover defaults, not measurements
+                g["errored"] += 1
+                continue
             for m, col in res["metrics"].items():
                 v, state = parse_org_value(row.get(col))
                 if state == "bad":
@@ -409,13 +417,67 @@ def match_row(org, repo_label, archive):
 
 # ---------------------------------------------------------------- comparison
 
-def compare_metrics(org, row, metrics, tolerance_pct):
-    """-> (errors: [finding], flags: [str], org_values: dict)"""
+EXTRA_WHAT = {"prs_git": "PRs in git history", "prs_metadata": "PRs in metadata", "loc": "lines of code"}
+
+
+def extra_findings(extras):
+    """WARN findings for what the archive holds MORE of than the reference: [(metric, amount, reference)]."""
+    out = []
+    for name, amount, ref in extras:
+        head = "Extra PRs detected" if name.startswith("prs") else f"Extra {name} detected"
+        out.append(ce.finding("WARN", "extra_metrics",
+                              f"{head}: {amount} more {EXTRA_WHAT.get(name, name)} than the reference's {ref}",
+                              expected=ref, found=ref + amount, item=name))
+    return out
+
+
+def extra_column(extras):
+    """`prs_git:+3;commits:+12`: one entry per metric with more than the reference; empty when there is none."""
+    return ";".join(f"{name}:+{amount}" for name, amount, _ in extras)
+
+
+def compare_prs(o, metrics, errors, flags, extras):
+    """The reference counts merged PRs. Look for that many in git history and, separately, in the metadata: fewer on either
+    side is a FAIL that names the side, more is an extra (unmerged or imported PRs explain it), never a failure."""
+    meta = metrics.get("prs_merged")
+    if meta is None:                 # no merged_at / closed_at / state in the export: all records is the best bound, and it
+        meta = metrics.get("prs_meta")   # can only hide a shortfall, never invent one
+    sides = (("git history", "prs_git", metrics.get("prs_git")), ("metadata", "prs_metadata", meta))
+    if all(found is None for _, _, found in sides):   # plain-git / unreadable layout never counted PRs: 0 would be a false shortfall
+        flags.append("ORG_UNCOMPARED:prs")
+        return
+    short = []
+    for where, key, found in sides:
+        if found is None:
+            flags.append(f"ORG_UNCOMPARED:{key}")
+        elif o > found:
+            short.append((where, found))
+        elif found > o:
+            extras.append((key, found - o, o))
+    if short:       # one finding for both sides, so a consumer summing missing counts per item never counts a PR twice
+        low = min(found for _, found in short)
+        errors.append(ce.finding("FAIL", "org_report_mismatch",
+                                 f"reference says {o} merged PRs; " + " and ".join(f"{where} holds {found}" for where, found in short),
+                                 expected=o, found=low, missing=None) | {"item": "prs", "missing_count": o - low})
+
+
+def compare_metrics(org, row, metrics, tolerance_pct, extras=None, superseded=()):
+    """-> (errors: [finding], flags: [str], org_values: dict). `extras`, when a list is given, receives
+    (metric, amount, reference) for every metric the archive holds more of than the reference. `superseded` names the
+    metrics a for-check bounds: the source's own counts outrank the org reference (profiler or client summary), so they
+    are not compared here and are flagged ORG_SUPERSEDED:<metric> instead."""
     errors, flags, vals = [], [], {}
+    extras = [] if extras is None else extras
     for m, col in org["metrics"].items():
         o = parse_org_value(row.get(col))[0]
         vals[m] = o
         if o is None:
+            continue
+        if m in superseded:
+            flags.append(f"ORG_SUPERSEDED:{m}")
+            continue
+        if m == "prs":
+            compare_prs(o, metrics, errors, flags, extras)
             continue
         if m == "commits":
             hi, lo = metrics.get("commits_all"), metrics.get("commits_head")
@@ -424,13 +486,6 @@ def compare_metrics(org, row, metrics, tolerance_pct):
                 continue
             found = hi
             lower_than = lo if lo is not None else hi
-        elif m == "prs":
-            counted = [metrics[k] for k in ("prs_git", "prs_meta") if metrics.get(k) is not None]
-            if not counted:      # plain-git / unreadable layout never counted PRs: 0 would be a false shortfall
-                flags.append("ORG_UNCOMPARED:prs")
-                continue
-            found = max(counted)
-            lower_than = found
         else:
             found = metrics.get(m)
             if found is None:
@@ -446,6 +501,7 @@ def compare_metrics(org, row, metrics, tolerance_pct):
                 flags.append("LOC_BRANCH_DIFF")      # the profiler may have measured another branch
         elif o < lower_than - slack:
             flags.append(f"ORG_LOWER:{m}")
+            extras.append((m, lower_than - o, o))
     return errors, flags, vals
 
 
@@ -674,6 +730,38 @@ def missing_rows(rec):
     return rows
 
 
+GAP_FIRST = ("commits", "pull_requests")       # always listed first, in this order
+# Checks whose failure compares a COUNT of what the archive lacks with a reference total (expected): source for-check
+# bounds (live_counts), the org CSV (org_report_mismatch), and set-membership misses whose expected is the reference
+# total (git/metadata PR numbers, merge shas, referenced labels/milestones, refs on the source).
+# Not listed on purpose: integrity / structural / format checks and anything without a numeric reference. file_refs (uploads, LFS
+# objects) has a numeric reference but stays out: a missing attachment is content nobody can recreate, so it is never tolerated.
+GAP_CHECKS = frozenset(GAP_FIRST) | {"live_counts", "org_report_mismatch", "merge_requests", "git_refs", "labels",
+                                     "milestones", "refs"}
+
+
+def gaps_column(rows):
+    """`commits=3/120;pull_requests=1/40;labels=2/9;org_report_mismatch:loc=50/1000`: missing/expected for each failed
+    count-based check, taken from the very rows missing_items.csv gets (`rows` = missing_rows output). A check that
+    reports per item is `<check>:<item>`. Information only, never read by Garmr's verdict."""
+    out = {}
+    for r in rows:
+        miss, exp = r["missing_count"], r["expected"]
+        if (r["repo"] == "*" or r["check"] not in GAP_CHECKS or isinstance(miss, bool) or isinstance(exp, bool)
+                or not isinstance(miss, int) or not isinstance(exp, int) or exp <= 0 or miss < 0):
+            continue
+        name = r["check"] if r["item"] in ("", None, r["check"]) else f"{r['check']}:{r['item']}"
+        out.setdefault(name, f"{name}={miss}/{exp}")
+    first = [out[c] for c in GAP_FIRST if c in out]
+    return ";".join(first + [out[k] for k in sorted(out) if k not in GAP_FIRST])
+
+
+def excess_column(extras):
+    """`commits=+12/90;prs_git=+3/5`: how many more than the reference the archive holds, with the reference (>0)."""
+    return ";".join(f"{n}=+{a}/{ref}" for n, a, ref in extras
+                    if isinstance(a, int) and isinstance(ref, int) and ref > 0 and a > 0)
+
+
 def c_no_archive_row(fc, archive=""):
     return {c: "" for c in REPORT_COLS} | {
         "repo": fc.label, "provider": fc.meta.get("provider") or "unknown", "archive": archive, "status": "NO_ARCHIVE",
@@ -698,7 +786,8 @@ def unmatched_org_rows(org, matched):
     for e in org["entries"]:
         if id(e) in matched:
             continue
-        flags = (["MULTI_ROW"] if e["rows"] > 1 else []) + [f"ORG_VALUE_UNPARSEABLE:{m}" for m in sorted(e["bad"])]
+        flags = (["MULTI_ROW"] if e["rows"] > 1 else []) + [f"ORG_VALUE_UNPARSEABLE:{m}" for m in sorted(e["bad"])] \
+            + (["ORG_ROW_ERROR"] if e.get("errored") else [])
         report.append({c: "" for c in REPORT_COLS} | {
             "repo": e["label"], "provider": "unknown", "archive": "", "status": "NO_ARCHIVE", "errors": 1,
             "warnings": 0, "failed_checks": "archive_missing", "org_csv_row": "yes", "flags": ";".join(flags),
@@ -709,12 +798,34 @@ def unmatched_org_rows(org, matched):
     return report, missing
 
 
+def apply_duplicates(pairs):
+    """Compare every checked repository's fingerprint with the others of this run (garmr.duplicates) and add the WARNs
+    and the `duplicates` column to their report rows. Needs at least two repositories; a label seen twice (two archives
+    of one repo) is compared under `label (archive)` so neither hides the other."""
+    if len(pairs) < 2:
+        return
+    keyed, seen = {}, {}
+    for row, fp in pairs:
+        key = row["repo"] if row["repo"] not in seen else f"{row['repo']} ({row['archive']})"
+        seen[row["repo"]] = True
+        keyed[key] = (row, fp)
+    results = duplicates.compare({k: fp for k, (_, fp) in keyed.items()})
+    for key, (row, _) in keyed.items():
+        found, col = duplicates.findings_and_column(key, results[key], ce.finding)
+        row["duplicates"] = col
+        if found:
+            row["warnings"] = int(row.get("warnings") or 0) + len(found)
+            checks = set(filter(None, (row.get("warned_checks") or "").split(";"))) | {x["check"] for x in found}
+            row["warned_checks"] = ";".join(sorted(checks))
+
+
 def build_rows(rec, st):
     """-> (report_rows, missing_rows) for one analysed repo record, in input order."""
     if rec.get("orphan_fc"):          # a for-check inside a zip whose tarball is not in that zip
         fc = rec["orphan_fc"]
         return [c_no_archive_row(fc, rec["archive"])], [no_archive_missing_row(fc, rec["archive"])]
     flags, vals, row_state, org = for_check_flags(rec), {}, "n/a", st["org"]
+    extras = []
     if rec["for_check"] == "no" and st["require_fc"]:
         rec["findings"].append(scoped(ce.finding(
             "FAIL", "for_check_missing", f"no {forcheck.for_check_name(Path(rec['archive'].split('!')[0]).name)} "
@@ -728,6 +839,8 @@ def build_rows(rec, st):
             row_state = "yes"
             e = hits[0]
             st["matched"] |= {id(h) for h in hits}
+            if any(h.get("errored") for h in hits):
+                flags.append("ORG_ROW_ERROR")
             if len(hits) > 1:
                 # several candidate rows: which one is this repo is a guess, so nothing is compared
                 flags.append("AMBIGUOUS_ORG_ROW")
@@ -735,9 +848,11 @@ def build_rows(rec, st):
                 if e["rows"] > 1:
                     flags.append("MULTI_ROW")
                 flags += [f"ORG_VALUE_UNPARSEABLE:{m}" for m in sorted(e["bad"])]
-                errs, fl, vals = compare_metrics(org, e["vals"], rec["metrics"], st["tol"])
-                rec["findings"] += errs
+                errs, fl, vals = compare_metrics(org, e["vals"], rec["metrics"], st["tol"], extras,
+                                                 rec["metrics"].get("for_check_supersedes") or ())
+                rec["findings"] += errs + extra_findings(extras)
                 flags += fl
+    all_extras = extras + list(rec["metrics"].get("for_check_extras") or [])
     fails = [x for x in rec["findings"] if x["level"] == "FAIL"]
     warns = [x for x in rec["findings"] if x["level"] == "WARN"]
     m = rec["metrics"]
@@ -745,15 +860,21 @@ def build_rows(rec, st):
         "repo": rec["repo"], "provider": rec["provider"], "archive": rec["archive"],
         "status": "INCOMPLETE" if fails else "COMPLETE", "errors": len(fails), "warnings": len(warns),
         "warned_checks": ";".join(sorted({x["check"] for x in warns})),
-        "failed_checks": ";".join(sorted({x["check"] for x in fails})), "for_check": rec["for_check"],
-        "commits_head": m.get("commits_head", ""), "commits_all": m.get("commits_all", ""),
-        "prs_git": m.get("prs_git", ""), "prs_meta": m.get("prs_meta", ""), "labels": m.get("labels", ""),
+        "failed_checks": ";".join(sorted({x["check"] for x in fails})), "gaps": "", "excess": excess_column(all_extras),
+        "for_check": rec["for_check"], "commits_head": m.get("commits_head", ""), "commits_all": m.get("commits_all", ""),
+        "measured_branch": m.get("measured_branch", ""), "measured_by": m.get("measured_by", ""),
+        "commits_measured": m.get("commits_measured", ""),
+        "prs_git": m.get("prs_git", ""), "prs_meta": m.get("prs_meta", ""),
+        "prs_merged": m.get("prs_merged", ""), "prs_unmerged": m.get("prs_unmerged", ""),
+        "visibility": m.get("visibility") or "unknown", "extra_metrics": extra_column(all_extras),
+        "history_tags": ";".join(ce.history_tags(rec["findings"], m)), "labels": m.get("labels", ""),
         "issues": m.get("issues", ""), "branches": m.get("branches", ""), "tags": m.get("tags", ""),
         "files": m.get("files", ""), "loc": "" if m.get("loc") is None else m["loc"],
         "org_csv_row": row_state, **{f"org_{k}": ("" if vals.get(k) is None else vals[k]) for k in ORG_METRICS},
         "flags": ";".join(flags)}
-    out = []
-    for r in missing_rows(rec):
+    out, mrows = [], missing_rows(rec)
+    row["gaps"] = gaps_column(mrows)
+    for r in mrows:
         if r["repo"] == "*":
             key = (r["archive"], r["check"], r["item"], r["detail"])
             if key in st["seen_star"]:
@@ -824,6 +945,7 @@ def _run(input_dir, output_dir, work_dir, live=None, want_loc=True, tolerance_pc
               "require_fc": os.environ.get("GARMR_REQUIRE_FOR_CHECK", "").strip().lower() in ("1", "true", "yes")}
         ctx = {"work": work_dir, "live": live, "want_loc": want_loc, "notes": notes}
         used: set = set()
+        fingerprints: list = []           # (report row, fingerprint) for the run-set duplicate comparison
         seen_archives, no_fc = set(), set()
         done = 0
         for n, arch in enumerate(archives, 1):
@@ -850,6 +972,9 @@ def _run(input_dir, output_dir, work_dir, live=None, want_loc=True, tolerance_pc
                 r, m = build_rows(rec, st)
                 rows += r
                 miss += m
+                fp = (rec.get("metrics") or {}).get("fingerprint")
+                if fp and len(r) == 1:
+                    fingerprints.append((r[0], fp))
                 if not rec.get("orphan_fc"):
                     seen_archives.add(rec["archive"])
                     if rec["for_check"] == "no":
@@ -871,6 +996,7 @@ def _run(input_dir, output_dir, work_dir, live=None, want_loc=True, tolerance_pc
             res["interrupted"] = _STOP["sig"]
             sink.abandon()
             return res
+        apply_duplicates(fingerprints)
         extra_r, extra_m = [], []
         for fc in fcs:
             if id(fc) not in used:

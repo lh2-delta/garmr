@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -19,6 +20,11 @@ COLUMNS = ["repo", "section", "key", "value"]
 GOOD_STATES = {"exported", "finished"}
 TAR_SUFFIXES = (".tar.gz", ".tgz", ".tar")
 SKIP_DIRS = {"__MACOSX"}
+# keys, in any section, under which a source records the repository's first (root) commit id(s)
+ROOT_KEYS = {"root_commit", "root_commits", "roots", "roots_sha", "first_commit", "initial_commit"}
+_SHA = re.compile(r"\b[0-9a-f]{40}\b|\b[0-9a-f]{64}\b")
+
+
 def to_int(v):
     try:
         return int(str(v).strip())
@@ -42,10 +48,15 @@ class ForCheck:
         self.counts = {"before": {}, "after": {}}   # repo(lower) -> {entity: raw value}
         self.refs = {"before": {}, "after": {}}     # repo(lower) -> {refname: sha}
         self.labels: dict[str, str] = {}            # repo(lower) -> label as written
+        self.roots: dict[str, set] = {}             # repo(lower) -> recorded root commit ids
         for repo, section, key, value in rows:
             self._add(repo, section, key, value)
 
     def _add(self, repo, section, key, value):
+        if key.strip().lower() in ROOT_KEYS:
+            shas = set(_SHA.findall((value or "").lower()))
+            if shas:
+                self.roots.setdefault(repo.lower(), set()).update(shas)
         if section == "meta":
             self.meta[key] = value
         elif section == "requested_repo":
@@ -106,6 +117,18 @@ class ForCheck:
             if v:
                 return v
         return None
+
+    def source_visibility(self, key: str):
+        """public / private / internal as the source stated it in a `visibility` count row, else None."""
+        for tag in ("after", "before"):
+            v = (self.counts[tag].get(key, {}).get("visibility") or "").strip().lower()
+            if v in ("public", "private", "internal"):
+                return v
+        return None
+
+    def recorded_roots(self, key: str) -> set:
+        """Root commit ids the source recorded for this repo (any section), plus any recorded without a repo label."""
+        return set(self.roots.get(key, set())) | set(self.roots.get("", set()))
 
     def ref_snapshots(self, key: str):
         return self.refs["before"].get(key, {}), self.refs["after"].get(key, {})
